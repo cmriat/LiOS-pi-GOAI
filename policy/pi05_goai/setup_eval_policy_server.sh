@@ -25,10 +25,13 @@ fi
 
 if [[ "${ckpt_name}" == /* ]]; then
     checkpoint="${ckpt_name}"
+elif [[ -d "${REPO_ROOT}/${ckpt_name}" ]]; then
+    checkpoint="${REPO_ROOT}/${ckpt_name}"
 elif [[ -d "${REPO_ROOT}/checkpoints/${ckpt_name}" ]]; then
     checkpoint="${REPO_ROOT}/checkpoints/${ckpt_name}"
 else
     echo "[SERVER][ERROR] checkpoint not found: ${ckpt_name}" >&2
+    echo "[SERVER][ERROR] checked ${REPO_ROOT}/${ckpt_name}" >&2
     echo "[SERVER][ERROR] checked ${REPO_ROOT}/checkpoints/${ckpt_name}" >&2
     exit 1
 fi

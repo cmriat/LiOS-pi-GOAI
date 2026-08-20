@@ -1,6 +1,8 @@
-# GOAI 2026 Submission — 评测推理说明
+# GOAI 2026 提交 · 评测启动方式
 
 本文件面向评测方：如何在本仓库 + 随附 checkpoint 上启动并评测我们的策略。
+
+> 以下命令均在仓库根目录执行（本文件位于 `docs-GOAI/`）。
 
 ## 1. 提交物构成
 
@@ -13,6 +15,14 @@
 | tokenizer | 已内置于 `assets/paligemma_tokenizer.model`，无需联网 |
 
 三者均位于 `lion-vla-ckpt/`（`ema` 的父目录），打包时请保持相对结构。
+
+**checkpoint 下载**：
+
+- 文件：`lion-vla-ckpt.tar`
+- 下载方式经提交邮件单独提供（不出现在本公开仓库中）
+- 下载后在仓库根目录解压（`tar -xf lion-vla-ckpt.tar`），得到
+  `lion-vla-ckpt/`（含 `ema/`、`norm_stats_pt.json`、`norm_stats_manifest.json`），
+  保持相对结构即可启动。
 
 ## 2. 环境安装（一次性）
 
@@ -36,11 +46,13 @@ pixi run -e goai-inference python scripts/inference/goai/sim_server.py \
   --apply-delta --seed 0
 ```
 
-亦可经 RoboDojo policy 目录接口启动（见 `policy/pi05_goai/README.md`）。
+亦可经 RoboDojo policy 目录接口启动（见仓库根目录 `policy/pi05_goai/README.md`）。
 
-**默认即定版配置**：`--action-horizon 8`、`--num-steps 20` 无需显式传参；
+**默认策略配置**：`--action-horizon 8`、`--num-steps 20` 无需显式传参；
 `--apply-delta` 为显式必传。服务端加载 checkpoint 时强校验训练契约
 （动作归一化模式 / horizon / 任务表），配置不一致会拒绝启动——这是特性。
+`--compile-mode` 默认 `none`；编译模式只影响吞吐和启动耗时，不改变模型、
+checkpoint 或动作语义。
 
 ## 4. 健康检查
 
@@ -77,3 +89,14 @@ PYTHONPATH=src pixi run -e goai-inference python scripts/inference/goai/mock_goa
 ```
 
 输出 `GOAI_MOCK_OK` 即协议通路正常。
+
+## 7. 关于 batch 推理
+
+本 policy server 定位为按调用粒度的推理服务：每条 WS 连接对应一个独立 session（会话/RNG 隔离），每次 `get_action` 即一次模型推理，服务端不感知评测端的多环境编排。多环境的并发请由评测端以**每环境一条连接**的方式管理。
+
+据此，本仓库当前未实现多环境合并的 batch 前向（一次推理返回多个环境的动作块）；服务端兼容 `update_obs_batch` / `get_action_batch` 的**单环境形式**（len==1 的批调用自动 unwrap）。多环境合并的 batch 调用会返回明确错误。
+
+多连接并发已端到端验证：提交前我们以 2 个 server + 14 个仿真实例
+（每实例独立连接）完成 24 配置 × 3 seeds × 1 episode = 72 episodes 的
+独立提交链复验，72/72 jobs 完成、0 failures。该复验用于验证仓库抽取、协议
+和推理链，不替代 1800 episodes 的本地 native 定版评测。
