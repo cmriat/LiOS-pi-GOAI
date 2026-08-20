@@ -1,21 +1,32 @@
 # Adapted from Physical-Intelligence/openpi (Apache-2.0). See NOTICE for details.
-"""Running statistics (mean / std / quantiles) for dataset normalization."""
 
+"""Normalization utilities."""
+
+# 动态计算、存储和加载数据归一化所需的统计量（均值、方差、分位数），供模型训练或推理时使用。
 import json
 import pathlib
 
 import numpy as np
+import torch
 import pydantic
 import numpydantic
-import torch
 
 
+# 和 Python 原生的 @dataclasses.dataclass 类似，会自动帮你生成 __init__、__repr__ 等方法。
+# 不同的是Pydantic 的 dataclass，它会在构造时做 类型检查 和 数据验证。
+# 也就是说：当你实例化 NormStats 的时候，Pydantic 会检查传进来的字段是不是符合 numpydantic.NDArray。
 @pydantic.dataclasses.dataclass
 class NormStats:
     mean: numpydantic.NDArray
     std: numpydantic.NDArray
     q01: numpydantic.NDArray | None = None  # 1st quantile
     q99: numpydantic.NDArray | None = None  # 99th quantile
+    # Optional action stats indexed by prediction timestep: [action_horizon, action_dim].
+    # These are used only when DatasetConfig.use_per_timestamp_action_norm is enabled.
+    per_timestamp_mean: numpydantic.NDArray | None = None
+    per_timestamp_std: numpydantic.NDArray | None = None
+    per_timestamp_q01: numpydantic.NDArray | None = None
+    per_timestamp_q99: numpydantic.NDArray | None = None
 
 
 class RunningStats:
@@ -36,7 +47,7 @@ class RunningStats:
         self._bin_edges = None
         self._num_quantile_bins = 5000  # for computing quantiles on the fly
         self._device = device
-        self._use_gpu = device is not None and (device != "cpu")
+        self._use_gpu = device is not None and (device != 'cpu')
 
     def update(self, batch: np.ndarray | torch.Tensor) -> None:
         """Update the running statistics with a batch of vectors.
@@ -70,7 +81,7 @@ class RunningStats:
     def _update_cpu(self, batch: np.ndarray, num_elements: int, vector_length: int) -> None:
         """CPU version of update using numpy."""
         if self._count == 0:
-            self._mean = np.mean(batch, axis=0)
+            self._mean = np.mean(batch, axis=0)  # 对每个action_dim求均值
             self._mean_of_squares = np.mean(batch**2, axis=0)
             self._min = np.min(batch, axis=0)
             self._max = np.max(batch, axis=0)
@@ -112,9 +123,7 @@ class RunningStats:
             self._max = torch.max(batch, dim=0)[0]
             self._histograms = [torch.zeros(self._num_quantile_bins, device=self._device) for _ in range(vector_length)]
             self._bin_edges = [
-                torch.linspace(
-                    self._min[i] - 1e-10, self._max[i] + 1e-10, self._num_quantile_bins + 1, device=self._device
-                )
+                torch.linspace(self._min[i] - 1e-10, self._max[i] + 1e-10, self._num_quantile_bins + 1, device=self._device)
                 for i in range(vector_length)
             ]
         else:
@@ -156,7 +165,10 @@ class RunningStats:
             q01, q99 = self._compute_quantiles([0.01, 0.99])
             # Convert to numpy for output
             return NormStats(
-                mean=self._mean.cpu().numpy(), std=stddev.cpu().numpy(), q01=q01.cpu().numpy(), q99=q99.cpu().numpy()
+                mean=self._mean.cpu().numpy(),
+                std=stddev.cpu().numpy(),
+                q01=q01.cpu().numpy(),
+                q99=q99.cpu().numpy()
             )
         else:
             variance = self._mean_of_squares - self._mean**2
@@ -218,7 +230,7 @@ class RunningStats:
                 # Count occurrences in each bin
                 hist = torch.bincount(indices, minlength=self._num_quantile_bins)
                 # Ensure correct size (bincount might return longer array)
-                hist = hist[: self._num_quantile_bins]
+                hist = hist[:self._num_quantile_bins]
                 self._histograms[i] += hist
         else:
             for i in range(batch.shape[1]):

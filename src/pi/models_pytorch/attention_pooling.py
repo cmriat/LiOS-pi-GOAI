@@ -6,6 +6,7 @@ to compress a long sequence of T historical states into M summary tokens.
 """
 
 import math
+
 import torch
 import torch.nn as nn
 

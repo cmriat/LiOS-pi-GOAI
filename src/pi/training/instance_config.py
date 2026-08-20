@@ -6,13 +6,68 @@ and referenced by the training scripts.
 """
 
 import tyro
+
 import pi.training.config as _config
 import pi.models.pi_config as pi_config
 import pi.training.optimizer as _optimizer
 
 
+def _goai_config(action_space: str) -> _config.TrainConfig:
+    if action_space not in {"joint", "ee"}:
+        raise ValueError(f"Unsupported GOAI action space: {action_space}")
+    dataset_name = f"goai_2026_{action_space}"
+    return _config.TrainConfig(
+        name=f"pi05_goai_{action_space}",
+        exp_name=f"pi05_goai_{action_space}",
+        model=pi_config.PiConfig(
+            pi05=True,
+            action_horizon=32,
+            max_token_len=200,
+            discrete_state_input=True,
+            use_task_embedding=False,
+            num_tasks=12,
+            state_history_frames=1,
+            state_delay_frames=0,
+        ),
+        data=_config.DatasetConfig(
+            repo_id=dataset_name,
+            asset_id=dataset_name,
+            # GOAI joint targets use arm-joint deltas with absolute grippers.
+            # The EE representation stays absolute.
+            apply_delta_transform=action_space == "joint",
+            use_quantile_norm=True,
+            action_sequence_keys=("action",),
+            state_sequence_keys=("observation.state",),
+            test_ep_num=0,
+        ),
+        parent_data_dir=None,
+        save_step_interval=5000,
+        save_epoch_interval=None,
+        checkpoint_base_dir="./checkpoints",
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=3e-5,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        num_workers=8,
+        log_interval=10,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="./data/pi05/pi05_pt",
+        overwrite=True,
+        resume=False,
+        num_epochs=10,
+        test_step_interval=None,
+    )
+
+
 # Predefined training configurations
 _CONFIGS = [
+    _goai_config("joint"),
+    _goai_config("ee"),
+
     _config.TrainConfig(
         name="pi05_airbot",
         exp_name="SET_FOR_YOUR_EXPERIMENT",

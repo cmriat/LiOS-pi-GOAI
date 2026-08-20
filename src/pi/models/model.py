@@ -1,4 +1,5 @@
 # Adapted from Physical-Intelligence/openpi (Apache-2.0). See NOTICE for details.
+
 """Model configuration and loading utilities."""
 
 import abc
@@ -59,28 +60,29 @@ from typing import Dict, Generic, TypeVar, Optional
 ArrayT = TypeVar("ArrayT")  # numpy.ndarray | torch.Tensor
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)  # frozen=True 保持不可变性
 class Observation(Generic[ArrayT]):
-    """Holds observations, i.e., inputs to the model.
+    """Holds observations, i.e., inputs to the model."""
 
-    Annotations were originally JAXtyping shapes in openpi; we keep the original
-    shape hints in trailing comments for reference.
-    """
+    # 替换JAXtyping注解为标准类型提示
+    images: Dict[str, ArrayT]  # 原: at.Float[ArrayT, "*b h w c"]
+    image_masks: Dict[str, ArrayT]  # 原: at.Bool[ArrayT, "*b"]
+    state: ArrayT  # 原: at.Float[ArrayT, "*b s"]
 
-    images: Dict[str, ArrayT]  # was: at.Float[ArrayT, "*b h w c"]
-    image_masks: Dict[str, ArrayT]  # was: at.Bool[ArrayT, "*b"]
-    state: ArrayT  # was: at.Float[ArrayT, "*b s"]
-
-    tokenized_prompt: Optional[ArrayT] = None  # was: at.Int[ArrayT, "*b l"]
-    tokenized_prompt_mask: Optional[ArrayT] = None  # was: at.Bool[ArrayT, "*b l"]
-    token_ar_mask: Optional[ArrayT] = None  # was: at.Int[ArrayT, "*b l"]
-    token_loss_mask: Optional[ArrayT] = None  # was: at.Bool[ArrayT, "*b l"]
+    # 可选字段
+    task_index: Optional[ArrayT] = None  # Learned task embedding lookup index.
+    tokenized_prompt: Optional[ArrayT] = None  # 原: at.Int[ArrayT, "*b l"]
+    tokenized_prompt_mask: Optional[ArrayT] = None  # 原: at.Bool[ArrayT, "*b l"]
+    token_ar_mask: Optional[ArrayT] = None  # 原: at.Int[ArrayT, "*b l"]
+    token_loss_mask: Optional[ArrayT] = None  # 原: at.Bool[ArrayT, "*b l"]
 
     @classmethod
     def from_dict(cls, data: Dict) -> "Observation[ArrayT]":
+        # from_dict 逻辑保持不变，只是类型注解改变
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
 
+        # 图像类型转换逻辑保持完全相同
         for key in data["image"]:
             if hasattr(data["image"][key], "dtype"):
                 if data["image"][key].dtype == np.uint8:
@@ -92,6 +94,7 @@ class Observation(Generic[ArrayT]):
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
+            task_index=data.get("task_index"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),

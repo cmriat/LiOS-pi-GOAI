@@ -19,7 +19,12 @@ from typing import Union, Callable, Optional
 
 import torch
 from torch import nn
-from transformers.utils import TransformersKwargs, logging, auto_docstring, can_return_tuple
+
+try:
+    from transformers.utils import LossKwargs
+except ImportError:  # transformers 4.55+
+    from transformers.utils import TransformersKwargs as LossKwargs
+from transformers.utils import logging, auto_docstring, can_return_tuple
 from transformers.generation import GenerationMixin
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -554,7 +559,7 @@ class GemmaModel(GemmaPreTrainedModel):
         )
 
 
-class KwargsForCausalLM(FlashAttentionKwargs, TransformersKwargs): ...
+class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
 @auto_docstring

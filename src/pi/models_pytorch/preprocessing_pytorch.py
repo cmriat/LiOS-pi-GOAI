@@ -1,4 +1,5 @@
 # Adapted from Physical-Intelligence/openpi (Apache-2.0). See NOTICE for details.
+
 """PyTorch preprocessing utilities."""
 
 import logging
@@ -13,6 +14,7 @@ logger = logging.getLogger("openpi")
 # Constants moved from model.py
 IMAGE_KEYS = (
     "base_0_rgb",
+    "base_1_rgb",
     "left_wrist_0_rgb",
     "right_wrist_0_rgb",
 )
@@ -149,15 +151,16 @@ def preprocess_observation_pytorch(
     observation,
     *,
     train: bool = False,
-    image_keys: Sequence[str] = IMAGE_KEYS,
+    image_keys: Sequence[str] | None = None,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
 ):
     """Torch.compile-compatible version of preprocess_observation_pytorch with simplified type annotations.
 
     This function avoids complex type annotations that can cause torch.compile issues.
     """
-    if not set(image_keys).issubset(observation.images):
-        raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
+    # Use actual image keys from observation if not specified
+    if image_keys is None:
+        image_keys = list(observation.images.keys())
 
     batch_shape = observation.state.shape[:-1]
 
@@ -260,7 +263,7 @@ def preprocess_observation_pytorch(
 
                 # Apply rotation to entire batch at once using grid_sample
                 image = torch.nn.functional.grid_sample(
-                    image.permute(0, 3, 1, 2).to(torch.float32),  # [batch, h, w, c] -> [batch, c, h, w]
+                    image.permute(0, 3, 1, 2),  # [batch, h, w, c] -> [batch, c, h, w]
                     grid,
                     mode="bilinear",
                     padding_mode="zeros",
@@ -319,6 +322,7 @@ def preprocess_observation_pytorch(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        task_index=observation.task_index,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

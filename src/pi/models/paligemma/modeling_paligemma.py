@@ -20,8 +20,12 @@ from dataclasses import dataclass
 import torch
 import torch.utils.checkpoint
 from torch import nn
+
+try:
+    from transformers.utils import LossKwargs
+except ImportError:  # transformers 4.55+
+    from transformers.utils import TransformersKwargs as LossKwargs
 from transformers.utils import (
-    TransformersKwargs,
     ModelOutput,
     logging,
     auto_docstring,
@@ -375,7 +379,7 @@ class PaliGemmaModel(PaliGemmaPreTrainedModel):
         )
 
 
-class KwargsForCausalLM(FlashAttentionKwargs, TransformersKwargs): ...
+class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
 @auto_docstring(

@@ -1,3 +1,10 @@
+# GOAI 2026 Submission
+
+This branch carries the GOAI 2026 bimanual-track submission inference.
+See [GOAI_SUBMISSION.md](./GOAI_SUBMISSION.md) for how to install, launch and evaluate it.
+
+---
+
 # pi
 
 [English](./README.md) | [中文](./README.zh-CN.md)

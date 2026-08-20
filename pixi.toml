@@ -132,5 +132,34 @@ liger-kernel = "*"
 neopyter = "*"
 tlparse = "*"
 
+[feature.goai-inference.system-requirements]
+cuda = "12.9"
+libc = { family = "glibc", version = "2.34" }
+
+[feature.goai-inference.dependencies]
+python = "3.10.*"
+pytorch = { version = "==2.7.1", build = "*cuda*" }
+transformers = "==4.53.2"
+sentencepiece = ">=0.2.0,<0.3"
+numpy = "<2"
+websockets = ">=13,<16"
+pydantic = ">=2,<3"
+numpydantic = ">=1.6.11,<2"
+pillow = "*"
+importlib_resources = ">=6.5.2,<7"
+msgspec = "*"
+tyro = ">=0.9.25,<0.10"
+etils = ">=1.12.2,<2"
+fsspec = "*"
+filelock = "*"
+safetensors = "*"
+absl-py = ">=2.2.0,<3"
+einops = "*"
+
+[feature.goai-inference.pypi-dependencies]
+pi = { path = ".", editable = true }
+tqdm_loggable = ">=0.2, <0.3"
+
 [environments]
 dev = { features = ["dev"], solve-group = "default" }
+goai-inference = { features = ["goai-inference"], solve-group = "goai-inference", no-default-feature = true }
