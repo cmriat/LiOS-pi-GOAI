@@ -6,7 +6,7 @@
 
 | 项 | 说明 |
 |--|--|
-| 代码 | 本仓库 `goai-submission` 分支（推理链 + policy 启动接口，自包含） |
+| 代码 | 本仓库（推理链 + policy 启动接口，自包含） |
 | checkpoint | `lion-vla-ckpt/ema`（torch DCP 格式）|
 | norm stats | `lion-vla-ckpt/norm_stats_pt.json` |
 | 训练契约 manifest | `lion-vla-ckpt/norm_stats_manifest.json`（启动强校验必读，已脱敏）|
@@ -17,7 +17,6 @@
 ## 2. 环境安装（一次性）
 
 ```bash
-cd lios-pi
 pixi install -e goai-inference
 ```
 
