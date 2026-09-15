@@ -104,7 +104,8 @@ The official debug wrapper replaces only the placeholder instruction, exercising
 raw/JPEG and single/batch paths. These tests do not measure physical success.
 See [INTERFACE.md](INTERFACE.md) for the policy boundary.
 
-To verify supervised warmup, all six tasks, reset and shutdown with the configured compilation mode:
+To verify supervised warmup, all six official full instructions, action parity
+with their legacy short aliases after reset, and shutdown with the configured compilation mode:
 
 ```bash
 pixi run -e goai-inference python scripts/inference/goai/validate_xpolicylab_startup.py \

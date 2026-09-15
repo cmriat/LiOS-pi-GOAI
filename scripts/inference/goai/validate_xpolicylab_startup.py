@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 import numpy as np
-from validate_xpolicylab import make_observation
+from validate_xpolicylab import compare, make_observation
 
 
 def main():
@@ -27,7 +27,7 @@ def main():
     sys.path[:0] = [str(root / "src"), str(bench), str(bench / "XPolicyLab")]
     from client_server.ws.model_client import WsModelClient
 
-    from pi.shared.goai_tasks import GOAI_REAL_TASK_INSTRUCTIONS
+    from pi.shared.goai_tasks import GOAI_REAL_TASK_INSTRUCTIONS, GOAI_REAL_LEGACY_TASK_INSTRUCTIONS
 
     out = args.output.expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -82,7 +82,8 @@ def main():
                         raise
                 else:
                     raise AssertionError("Warmup left an actionable observation behind")
-                for instruction in GOAI_REAL_TASK_INSTRUCTIONS:
+                # Exercise official full sentences against the real server and weights.
+                for slot, instruction in enumerate(GOAI_REAL_TASK_INSTRUCTIONS):
                     client.call("reset")
                     client.call("update_obs", make_observation(instruction))
                     began = time.monotonic()
@@ -106,7 +107,11 @@ def main():
                             value = np.asarray(action[key])
                             if value.shape != (size,) or not np.isfinite(value).all():
                                 raise AssertionError(f"Invalid action {key}")
-                    results.append({"task": instruction, "latency_ms": (time.monotonic() - began) * 1000})
+                    elapsed_ms = (time.monotonic() - began) * 1000
+                    client.call("reset")
+                    client.call("update_obs", make_observation(GOAI_REAL_LEGACY_TASK_INSTRUCTIONS[slot]))
+                    compare(client.call("get_action"), actions)
+                    results.append({"task": instruction, "slot": slot, "legacy_parity": True, "latency_ms": elapsed_ms})
                 client.call("trial_end", {"synthetic": True})
         finally:
             if process.poll() is None:

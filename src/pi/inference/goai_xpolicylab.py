@@ -14,7 +14,7 @@ import numpy as np
 
 from pi.shared.goai_tasks import (
     GOAI_REAL_TASK_INSTRUCTIONS,
-    GOAI_REAL_OFFICIAL_TASK_INSTRUCTIONS,
+    GOAI_REAL_LEGACY_TASK_INSTRUCTIONS,
     normalize_task_instruction,
 )
 
@@ -38,7 +38,7 @@ _TASKS.update({normalize_task_instruction(slug): (i, GOAI_REAL_TASK_INSTRUCTIONS
 _TASKS.update(
     {
         normalize_task_instruction(text): (i, GOAI_REAL_TASK_INSTRUCTIONS[i])
-        for i, text in enumerate(GOAI_REAL_OFFICIAL_TASK_INSTRUCTIONS)
+        for i, text in enumerate(GOAI_REAL_LEGACY_TASK_INSTRUCTIONS)
     }
 )
 _CAMERAS = {

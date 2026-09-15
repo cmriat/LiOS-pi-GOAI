@@ -211,12 +211,12 @@ def with_instruction(value):
 
 def test_nearest_match_table():
     accepted = {
-        "Stack the bowls": ("Stack the bowls", True),
-        "stack_bowls": ("Stack the bowls", True),
-        "  STACK THE BOWLS!! ": ("Stack the bowls", True),
-        "stack the bowl": ("Stack the bowls", False),
-        "Stand up the bottle": ("Stand up the bottles", False),
-        "stack and cover block": ("Stack and cover the blocks", False),
+        "Stack the bowls": (adapter.GOAI_REAL_TASK_INSTRUCTIONS[3], True),
+        "stack_bowls": (adapter.GOAI_REAL_TASK_INSTRUCTIONS[3], True),
+        "  STACK THE BOWLS!! ": (adapter.GOAI_REAL_TASK_INSTRUCTIONS[3], True),
+        "stack the bowl": (adapter.GOAI_REAL_TASK_INSTRUCTIONS[3], False),
+        "Stand up the bottle": (adapter.GOAI_REAL_TASK_INSTRUCTIONS[4], False),
+        "stack and cover block": (adapter.GOAI_REAL_TASK_INSTRUCTIONS[2], False),
     }
     for value, (instruction, exact) in accepted.items():
         index, resolved, ratio, was_exact = adapter.resolve_real_task_nearest(value)
@@ -233,20 +233,20 @@ def test_client_instruction_decides_the_session_task(model):
     model.update_obs(with_instruction("Insert the charger"))
     model.get_action()
     assert model.policy.calls[-1][1] == 5
-    assert model._observations[0]["instruction"] == "Insert the charger"
+    assert model._observations[0]["instruction"] == adapter.GOAI_REAL_TASK_INSTRUCTIONS[5]
 
 
 def test_missing_instruction_falls_back_to_the_configured_task(model):
     model.update_obs(with_instruction(None))
     model.get_action()
     assert model.policy.calls[-1][1] == 3
-    assert model._observations[0]["instruction"] == "Stack the bowls"
+    assert model._observations[0]["instruction"] == adapter.GOAI_REAL_TASK_INSTRUCTIONS[3]
 
 
 def test_typo_is_resolved_to_the_nearest_task(model, caplog):
     with caplog.at_level(logging.WARNING):
         model.update_obs(with_instruction("Stack the bowl"))
-    assert model._observations[0]["instruction"] == "Stack the bowls"
+    assert model._observations[0]["instruction"] == adapter.GOAI_REAL_TASK_INSTRUCTIONS[3]
     assert "未精确匹配" in caplog.text
 
 
@@ -456,7 +456,7 @@ def test_model_prefix_rejects_empty_images_before_embedding():
         PI0Pytorch.embed_prefix(SimpleNamespace(), [], [], None, None)
 
 
-@pytest.mark.parametrize("slot,instruction", list(enumerate(adapter.GOAI_REAL_OFFICIAL_TASK_INSTRUCTIONS)))
+@pytest.mark.parametrize("slot,instruction", list(enumerate(adapter.GOAI_REAL_TASK_INSTRUCTIONS)))
 def test_official_instructions_preserve_legacy_embedding_slots(model, slot, instruction):
     assert adapter.resolve_real_task(instruction) == (slot, adapter.GOAI_REAL_TASK_INSTRUCTIONS[slot])
     assert adapter.resolve_real_task_nearest(instruction)[2:] == (1.0, True)
@@ -467,7 +467,7 @@ def test_official_instructions_preserve_legacy_embedding_slots(model, slot, inst
     model.get_action()
     assert model.policy.calls[-1][1] == slot
     model.reset()
-    obs["instruction"] = adapter.GOAI_REAL_TASK_INSTRUCTIONS[slot]
+    obs["instruction"] = adapter.GOAI_REAL_LEGACY_TASK_INSTRUCTIONS[slot]
     model.update_obs(obs)
     model.get_action()
     assert model.policy.calls[-1][1:] == (slot, 42, 0)

@@ -7,7 +7,7 @@ import unicodedata
 from dataclasses import dataclass
 from collections.abc import Mapping
 
-GOAI_REAL_TASK_INSTRUCTIONS = (
+GOAI_REAL_LEGACY_TASK_INSTRUCTIONS = (
     "Fill the pen holder",
     "Put the objects into the basket",
     "Stack and cover the blocks",
@@ -15,8 +15,8 @@ GOAI_REAL_TASK_INSTRUCTIONS = (
     "Stand up the bottles",
     "Insert the charger",
 )
-# Official full instructions address the same embedding slots as the legacy names.
-GOAI_REAL_OFFICIAL_TASK_INSTRUCTIONS = (
+# Canonical instructions match the official dataset and the Pi training repository.
+GOAI_REAL_TASK_INSTRUCTIONS = (
     "Pick up the pen holder and place all the pens into it.",
     "Place all the objects on the table into the basket.",
     "Stack the blocks on the table, then cover them with the cup.",
@@ -24,6 +24,7 @@ GOAI_REAL_OFFICIAL_TASK_INSTRUCTIONS = (
     "Stand the bottle upright.",
     "Insert the charger plug into the power strip, then connect the charging cable to the plug.",
 )
+GOAI_REAL_OFFICIAL_TASK_INSTRUCTIONS = GOAI_REAL_TASK_INSTRUCTIONS
 GOAI_TASK_MATCH_MIN_SCORE = 0.80
 GOAI_TASK_MATCH_AMBIGUITY_MARGIN = 0.05
 
@@ -54,6 +55,7 @@ def normalize_task_instruction(text: str) -> str:
 
 
 _NORMALIZED_CANONICAL_TASKS = tuple(normalize_task_instruction(text) for text in GOAI_REAL_TASK_INSTRUCTIONS)
+_NORMALIZED_LEGACY_TASKS = tuple(normalize_task_instruction(text) for text in GOAI_REAL_LEGACY_TASK_INSTRUCTIONS)
 
 
 def _task_scores(text: str) -> list[tuple[int, float]]:
@@ -73,7 +75,11 @@ def _score_table(text: str, scores: list[tuple[int, float]]) -> str:
 def match_task_details(text: str) -> GOAITaskMatch:
     """Match language to one official real-task slot, rejecting weak or ambiguous matches."""
     normalized = normalize_task_instruction(text)
-    exact_slots = [slot for slot, canonical in enumerate(_NORMALIZED_CANONICAL_TASKS) if normalized == canonical]
+    exact_slots = [
+        slot
+        for slot, canonical in enumerate(_NORMALIZED_CANONICAL_TASKS)
+        if normalized in (canonical, _NORMALIZED_LEGACY_TASKS[slot])
+    ]
     if len(exact_slots) == 1:
         slot = exact_slots[0]
         return GOAITaskMatch(slot, 1.0, "exact", GOAI_REAL_TASK_INSTRUCTIONS[slot])

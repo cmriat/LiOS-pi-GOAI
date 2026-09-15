@@ -16,7 +16,7 @@ genuinely tied aliases may be omitted from EMA. All tasks share one model.
 
 ## Tasks
 
-| Slot | Slug | Canonical instruction |
+| Slot | Slug | Legacy instruction alias |
 | --- | --- | --- |
 | 0 | fill_pen_holder | Fill the pen holder |
 | 1 | put_objects_into_basket | Put the objects into the basket |
@@ -109,7 +109,10 @@ returns `payload.actions`; the two-call path uses `payload.func_name` and
 and defaults to environment 0. Both paths use the same unchanged official server.
 
 
-The six official full instructions are also exact aliases of slots 0–5:
+The canonical `GOAI_REAL_TASK_INSTRUCTIONS` contains the following official
+full instructions for slots 0–5, matching the Pi training repository. Short
+forms live in `GOAI_REAL_LEGACY_TASK_INSTRUCTIONS` and remain exact aliases
+in both the dataset matcher and deployment adapter:
 
 1. Pick up the pen holder and place all the pens into it.
 2. Place all the objects on the table into the basket.
