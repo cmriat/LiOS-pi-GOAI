@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 import difflib
 import hashlib
@@ -17,6 +16,7 @@ from pi.shared.goai_tasks import (
     GOAI_REAL_LEGACY_TASK_INSTRUCTIONS,
     normalize_task_instruction,
 )
+from pi.inference.goai_helpers import load_checkpoint_manifest, resolve_checkpoint_config_name
 
 logger = logging.getLogger(__name__)
 
@@ -210,35 +210,33 @@ def _integer(value, name, minimum=0):
 
 
 def validate_checkpoint(checkpoint):
-    """Check the trained ABC contract and its exact adjacent statistics before loading."""
+    """Check the checkpoint is complete and carries the statistics its weights were trained against.
+
+    Two file-level checks, and deliberately nothing else:
+
+    - the DCP ``.metadata`` exists -- without it this is not a checkpoint at all;
+    - ``norm_stats_pt.json`` hashes to a digest the selected training manifest entry declares.
+      Unnormalizing with statistics the weights never saw produces garbage actions
+      *silently*, which is the one failure here worth paying to catch.
+
+    It does **not** compare the training recipe against a frozen table. ``GOAISimPolicy``
+    rebuilds the model config from the checkpoint's own manifest entry (``dataclasses.replace``
+    over eleven architecture fields), so the weights are authoritative for their own shape,
+    and a structural mismatch is still caught downstream by ``validate_goai_dcp_coverage``
+    on tensor shapes. A pinned recipe table can only go stale: the run that moved to six
+    tasks and a single embodiment (2026-09-15) was rejected wholesale by one.
+    """
     checkpoint = Path(checkpoint).expanduser().resolve()
     if not (checkpoint / ".metadata").is_file():
         raise FileNotFoundError(f"Missing DCP metadata: {checkpoint}")
     step = checkpoint.parent if checkpoint.name == "ema" else checkpoint
-    manifest = json.loads((step / "norm_stats_manifest.json").read_text())
-    entries = [e for e in manifest["files"] if e.get("config_name") == "pi05_goai_joint"]
-    if len(entries) != 1:
-        raise ValueError("Expected exactly one pi05_goai_joint manifest entry")
-    entry = entries[0]
-    expected = {
-        "use_task_embedding": True,
-        "use_language_with_task_embedding": False,
-        "use_embodiment_embedding": True,
-        "num_embodiments": 2,
-        "num_embodiment_tokens": 1,
-        "num_tasks": 12,
-        "action_horizon": 32,
-        "use_quantile_norm": True,
-        "use_per_timestamp_action_norm": True,
-        "apply_delta_transform": True,
-        "task_embedding_target": "vlm",
-        "state_conditioning_mode": "discrete_vlm",
-    }
-    for key, value in expected.items():
-        if type(entry.get(key)) is not type(value) or entry[key] != value:
-            raise ValueError(f"Unsupported ABC contract {key}={entry.get(key)!r}; expected {value!r}")
+    manifest = load_checkpoint_manifest(checkpoint)
     stats = step / "norm_stats_pt.json"
-    if hashlib.sha256(stats.read_bytes()).hexdigest() != entry.get("sha256"):
+    config_name = resolve_checkpoint_config_name(checkpoint)
+    entries = [entry for entry in manifest.get("files", []) if entry.get("config_name") == config_name]
+    if len(entries) != 1:
+        raise ValueError(f"Expected one {config_name!r} training entry, found {len(entries)}")
+    if hashlib.sha256(stats.read_bytes()).hexdigest() != entries[0].get("sha256"):
         raise ValueError("Checkpoint norm stats SHA256 mismatch")
     return checkpoint, stats
 
@@ -302,6 +300,8 @@ class Model:
         self.policy = self._load_policy(
             checkpoint=checkpoint,
             norm_stats=stats,
+            # 架构随权重走:从 ckpt 自己的 manifest 读,不写死,否则换一条训练线就得改代码。
+            config_name=resolve_checkpoint_config_name(checkpoint),
             task_name=None,
             device=model_cfg.get("device", "cuda:0"),
             action_horizon=self.execution_horizon,

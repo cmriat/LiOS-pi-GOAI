@@ -249,6 +249,21 @@ def assemble_goai_state(observation: Mapping[str, Any]) -> np.ndarray:
     return state
 
 
+def _pad_state(state: np.ndarray, target_dim: int) -> np.ndarray:
+    """Right-pad a state vector to the model's action dimension, exactly as training does.
+
+    Mirrors ``pi.data._pad_state_actions``: the last axis is zero-extended. The model
+    always works in ``action_dim``-wide space -- actions are sliced back down by
+    ``infer`` -- and the dual architecture's continuous Expert token consumes the padded
+    state directly.
+    """
+    state = np.asarray(state, dtype=np.float32)
+    if state.shape[-1] >= target_dim:
+        return state
+    pad_width = [(0, 0)] * (state.ndim - 1) + [(0, target_dim - state.shape[-1])]
+    return np.pad(state, pad_width, constant_values=0.0)
+
+
 def _camera_color(vision: Mapping[str, Any], key: str, aliases: tuple[str, ...]) -> Any:
     for alias in aliases:
         if alias not in vision:
@@ -406,9 +421,9 @@ class GOAISimPolicy:
             if embodiment_index != 0:
                 raise ValueError("embodiment_index is only valid for embodiment-conditioned checkpoints")
             self.embodiment_index = 0
-        if self.model_config.num_tasks != len(GOAI_TASK_NAMES):
+        if self.task_index is not None and not 0 <= self.task_index < self.model_config.num_tasks:
             raise ValueError(
-                f"GOAI task table has {len(GOAI_TASK_NAMES)} entries, checkpoint expects {self.model_config.num_tasks}"
+                f"Task index {self.task_index} is outside checkpoint slots [0, {self.model_config.num_tasks})"
             )
         if not 1 <= action_horizon <= self.model_config.action_horizon:
             raise ValueError(f"action_horizon must be in [1, {self.model_config.action_horizon}], got {action_horizon}")
@@ -531,6 +546,10 @@ class GOAISimPolicy:
         if self.model_config.use_task_embedding:
             if session.task_index is None or session.task_name is None:
                 raise ValueError("GOAI task embedding requires a task bound to the client session")
+            if not 0 <= session.task_index < self.model_config.num_tasks:
+                raise ValueError(
+                    f"Task index {session.task_index} is outside checkpoint slots [0, {self.model_config.num_tasks})"
+                )
             task_index = torch.tensor([session.task_index], dtype=torch.long, device=self.device)
             if self.model_config.use_language_with_task_embedding:
                 prompt = adapted["prompt"]
@@ -556,7 +575,14 @@ class GOAISimPolicy:
         data: dict[str, torch.Tensor | dict[str, torch.Tensor]] = {
             "image": images,
             "image_mask": {key: torch.ones(1, dtype=torch.bool, device=self.device) for key in GOAI_MODEL_IMAGE_KEYS},
-            "state": torch.as_tensor(normalized_state, dtype=torch.float32, device=self.device).reshape(1, 1, -1),
+            # 训练侧 _tokenize_prompt 在 _pad_state_actions **之前**,所以 tokenization 用的是
+            # 14 维原始 state(上面已用 normalized_state 完成),而模型内部一律工作在 action_dim
+            # 维空间:动作侧靠 infer() 里的 [:GOAI_ACTION_DIM] 切回来,state 侧就必须在这里补齐。
+            # dual 的连续 Expert token 直接吃这 32 维,少了这步会报
+            # "expects state shape [batch, 1, 32], got (1, 1, 14)"。填充方式与训练
+            # _pad_state_actions 一致:最后一维右侧补零。(2026-09-15)
+            "state": torch.as_tensor(_pad_state(normalized_state, self.model_config.action_dim),
+                                     dtype=torch.float32, device=self.device).reshape(1, 1, -1),
             "tokenized_prompt": torch.as_tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0),
             "tokenized_prompt_mask": torch.as_tensor(token_mask, dtype=torch.bool, device=self.device).unsqueeze(0),
         }

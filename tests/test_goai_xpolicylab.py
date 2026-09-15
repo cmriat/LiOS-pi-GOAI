@@ -153,17 +153,29 @@ def test_invalid_inputs_rejected(model, mutation):
         model.update_obs(obs)
 
 
-def test_wrong_stats_and_contract_rejected(checkpoint):
-    stats = checkpoint.parent / "norm_stats_pt.json"
-    stats.write_text("changed")
+def test_wrong_stats_rejected(checkpoint):
+    """统计量与 manifest 声明不符必拒 —— 拿错的统计量反归一化会**静默**产出垃圾动作。"""
+    (checkpoint.parent / "norm_stats_pt.json").write_text("changed")
     with pytest.raises(ValueError, match="SHA256"):
         adapter.validate_checkpoint(checkpoint)
+
+
+def test_recipe_is_the_checkpoints_own_business(checkpoint):
+    """训练配方不再被一张写死的表管 —— checkpoint 自己就是权威。
+
+    2026-09-15:原先逐字段比对一张钉死的配方表,训练线换到 6 任务 / 单本体后把整批
+    checkpoint 全拒了。模型配置由 GOAISimPolicy 从 manifest 重建,结构错配由
+    validate_goai_dcp_coverage 按 shape 拦住。这两条一起钉住边界:改配方不拒,改统计量必拒。
+    """
     manifest_path = checkpoint.parent / "norm_stats_manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["files"][0]["use_embodiment_embedding"] = False
+    manifest["files"][0]["num_tasks"] = 12
+    manifest["files"][0]["state_conditioning_mode"] = "dual"
     manifest_path.write_text(json.dumps(manifest))
-    with pytest.raises(ValueError, match="use_embodiment_embedding"):
-        adapter.validate_checkpoint(checkpoint)
+
+    _, stats = adapter.validate_checkpoint(checkpoint)  # 不该抛
+    assert stats == checkpoint.parent / "norm_stats_pt.json"
 
 
 def test_bad_output_and_case_rejected(model):
@@ -471,3 +483,23 @@ def test_official_instructions_preserve_legacy_embedding_slots(model, slot, inst
     model.update_obs(obs)
     model.get_action()
     assert model.policy.calls[-1][1:] == (slot, 42, 0)
+
+
+def test_stats_must_match_selected_training_entry(checkpoint):
+    manifest_path = checkpoint.parent / "norm_stats_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    changed = b'{"norm_stats": {"wrong": true}}'
+    (checkpoint.parent / "norm_stats_pt.json").write_bytes(changed)
+    manifest["files"].append({"checkpoint_path": "other.json", "sha256": hashlib.sha256(changed).hexdigest()})
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="SHA256"):
+        adapter.validate_checkpoint(checkpoint)
+
+
+def test_duplicate_training_entries_rejected(checkpoint):
+    path = checkpoint.parent / "norm_stats_manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["files"].append(dict(manifest["files"][0]))
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="training entry"):
+        adapter.validate_checkpoint(checkpoint)

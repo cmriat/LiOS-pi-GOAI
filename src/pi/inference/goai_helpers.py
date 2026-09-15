@@ -49,7 +49,13 @@ def unnormalize_zscore(array: np.ndarray, stats: Any) -> np.ndarray:
     return array * (std + 1e-6) + mean
 
 
-def _load_checkpoint_manifest_entry(checkpoint: Path, config_name: str) -> dict[str, Any]:
+def load_checkpoint_manifest(checkpoint: Path | str) -> dict[str, Any]:
+    """Read the training manifest that sits beside a checkpoint.
+
+    ``step<N>/ema`` carries its own copy; a plain ``step<N>`` does too. Either way the
+    manifest is the checkpoint's own record of how it was trained.
+    """
+    checkpoint = Path(checkpoint).expanduser()
     manifest_path = checkpoint / "norm_stats_manifest.json"
     if not manifest_path.is_file() and checkpoint.name == "ema":
         parent_manifest_path = checkpoint.parent / "norm_stats_manifest.json"
@@ -61,13 +67,32 @@ def _load_checkpoint_manifest_entry(checkpoint: Path, config_name: str) -> dict[
             "Legacy checkpoints used wrong 640x480 padding and are not supported by this pipeline."
         )
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"Invalid checkpoint manifest {manifest_path}: {error}") from error
 
+
+def resolve_checkpoint_config_name(checkpoint: Path) -> str:
+    """Return the training config a checkpoint was produced with.
+
+    Every GOAI checkpoint records exactly one ``config_name`` beside it, so the server
+    reads the architecture off the weights instead of being told separately -- one less
+    thing that can be set wrong, and a checkpoint can never disagree with its own label.
+    """
+    manifest = load_checkpoint_manifest(checkpoint)
+    names = sorted({str(entry["config_name"]) for entry in manifest.get("files", []) if entry.get("config_name")})
+    if len(names) != 1:
+        raise ValueError(f"Expected exactly one config_name beside {checkpoint}, found {names}")
+    return names[0]
+
+
+def _load_checkpoint_manifest_entry(checkpoint: Path, config_name: str) -> dict[str, Any]:
+    manifest = load_checkpoint_manifest(checkpoint)
     entries = [entry for entry in manifest.get("files", []) if entry.get("config_name") == config_name]
     if len(entries) != 1:
-        raise ValueError(f"Expected one {config_name!r} entry in {manifest_path}, found {len(entries)}")
+        raise ValueError(
+            f"Expected one {config_name!r} entry beside {checkpoint}, found {len(entries)}"
+        )
     entry = dict(entries[0])
     entry["_manifest_version"] = manifest.get("version")
     return entry

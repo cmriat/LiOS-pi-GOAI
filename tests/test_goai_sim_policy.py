@@ -240,3 +240,81 @@ def test_policy_rejects_manifest_delta_mismatch_before_weight_load(tmp_path, mon
             norm_stats,
             apply_delta=False,
         )
+
+
+@pytest.mark.parametrize("slots", [6, 12])
+def test_checkpoint_task_count_reaches_model_construction(tmp_path, monkeypatch, slots):
+    from pi.inference import goai_sim_policy as backend
+
+    checkpoint = tmp_path / "step"
+    checkpoint.mkdir()
+    (checkpoint / ".metadata").touch()
+    stats = {
+        key: {"mean": [0.0] * 14, "std": [1.0] * 14, "q01": [-1.0] * 14, "q99": [1.0] * 14}
+        for key in ("state", "actions")
+    }
+    stats_path = checkpoint / "norm_stats_pt.json"
+    stats_path.write_text(json.dumps({"norm_stats": stats}))
+    contract = dict(
+        action_horizon=32,
+        max_token_len=200,
+        use_task_embedding=True,
+        use_language_with_task_embedding=False,
+        use_embodiment_embedding=False,
+        num_embodiments=1,
+        num_embodiment_tokens=1,
+        task_embedding_target="vlm",
+        state_conditioning_mode="discrete_vlm",
+        num_tasks=slots,
+        apply_delta_transform=True,
+        use_quantile_norm=True,
+        use_per_timestamp_action_norm=False,
+    )
+    monkeypatch.setattr(backend, "load_goai_checkpoint_training_contract", lambda *_args: contract)
+
+    class ReachedModel(Exception):
+        pass
+
+    def stop_at_model(config):
+        assert config.num_tasks == slots
+        raise ReachedModel
+
+    monkeypatch.setattr(backend, "PI0Pytorch", stop_at_model)
+    with pytest.raises(ReachedModel):
+        backend.GOAISimPolicy(checkpoint, stats_path, apply_delta=True, device="cpu")
+
+
+@pytest.mark.parametrize("index", [-1, 6, 11])
+def test_session_task_index_checked_against_checkpoint(monkeypatch, index):
+    from pi.inference import goai_sim_policy as backend
+
+    monkeypatch.setattr(backend, "adapt_robodojo_observation", lambda _obs: {})
+    monkeypatch.setattr(backend, "normalize_values", lambda value, *_args, **_kwargs: value)
+    policy = SimpleNamespace(
+        model_config=SimpleNamespace(use_task_embedding=True, num_tasks=6),
+        norm_stats={"state": None},
+        use_quantile_norm=True,
+    )
+    session = SimpleNamespace(task_index=index, task_name="test")
+    with pytest.raises(ValueError, match="outside checkpoint slots"):
+        backend.GOAISimPolicy._prepare_observation(policy, {}, np.zeros(14), session)
+
+
+def test_state_is_padded_to_action_dim():
+    """模型内部一律是 action_dim 宽:动作侧由 infer 切回来,state 侧必须在这里补齐。
+
+    dual 的连续 Expert token 直接吃这 32 维,漏了会报
+    "expects state shape [batch, 1, 32], got (1, 1, 14)"。
+    训练侧顺序是先 _tokenize_prompt 再 _pad_state_actions —— 所以 tokenization 仍用
+    14 维原始 state,这里只钉住"喂给模型的那份"。
+    """
+    from pi.inference.goai_sim_policy import _pad_state
+
+    state = np.arange(14, dtype=np.float32)
+    padded = _pad_state(state, 32)
+    assert padded.shape == (32,)
+    np.testing.assert_array_equal(padded[:14], state)
+    assert not padded[14:].any(), "必须是右侧零填充,与训练 _pad_state_actions 一致"
+    assert _pad_state(state, 32).dtype == np.float32
+    assert _pad_state(state, 14).shape == (14,), "已够宽就原样返回"
+    assert _pad_state(np.stack([state, state]), 32).shape == (2, 32)

@@ -5,6 +5,8 @@ This file contains preset training configurations that can be easily modified
 and referenced by the training scripts.
 """
 
+import dataclasses
+
 import tyro
 
 import pi.training.config as _config
@@ -67,6 +69,26 @@ def _goai_config(action_space: str) -> _config.TrainConfig:
 _CONFIGS = [
     _goai_config("joint"),
     _goai_config("ee"),
+
+    # Shell for real-robot checkpoints trained with the B1K dual state conditioning.
+    # The server reads this name off the checkpoint's own manifest, so the entry has to
+    # exist; every architecture field below is overwritten from that manifest when the
+    # weights load (see GOAISimPolicy), which is why this is derived from the sim config
+    # rather than duplicated. Only the fields that differ are written out.
+    dataclasses.replace(
+        _goai_config("joint"),
+        name="pi05_b1k_goai",
+        exp_name="pi05_b1k_goai",
+        model=dataclasses.replace(
+            _goai_config("joint").model,
+            max_token_len=288,
+            use_task_embedding=True,
+            use_language_with_task_embedding=True,
+            num_tasks=6,
+            task_embedding_target="expert",
+            state_conditioning_mode="dual",
+        ),
+    ),
 
     _config.TrainConfig(
         name="pi05_airbot",
