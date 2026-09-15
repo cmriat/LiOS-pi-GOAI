@@ -137,12 +137,19 @@ cuda = "12.9"
 libc = { family = "glibc", version = "2.34" }
 
 [feature.goai-inference.dependencies]
+# Required by Triton/Inductor during reduce-overhead warmup.
+cuda-cudart-dev = "12.9.*"
+cxx-compiler = "*"
+h5py = "*"
+pyyaml = "*"
+msgpack-python = ">=1.0.8"
+pytest = "*"
 python = "3.10.*"
 pytorch = { version = "==2.7.1", build = "*cuda*" }
 transformers = "==4.53.2"
 sentencepiece = ">=0.2.0,<0.3"
 numpy = "<2"
-websockets = ">=13,<16"
+websockets = ">=14,<16"
 pydantic = ">=2,<3"
 numpydantic = ">=1.6.11,<2"
 pillow = "*"
@@ -157,9 +164,15 @@ absl-py = ">=2.2.0,<3"
 einops = "*"
 
 [feature.goai-inference.pypi-dependencies]
+msgpack-numpy = ">=0.4.8"
+opencv-python-headless = "==4.11.0.86"
 pi = { path = ".", editable = true }
 tqdm_loggable = ">=0.2, <0.3"
 
+[feature.goai-inference.tasks]
+serve_goai = "python scripts/inference/goai/serve_xpolicylab.py"
+
 [environments]
+default = { features = ["goai-inference"], solve-group = "goai-inference", no-default-feature = true }
 dev = { features = ["dev"], solve-group = "default" }
 goai-inference = { features = ["goai-inference"], solve-group = "goai-inference", no-default-feature = true }

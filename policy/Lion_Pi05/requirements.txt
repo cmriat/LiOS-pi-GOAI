@@ -1,0 +1,8 @@
+# Optional official-framework dependencies for an existing model environment.
+# The complete, locked runtime (including CUDA compilation) is in pixi.toml.
+websockets>=14,<16
+msgpack>=1.0.8
+msgpack-numpy>=0.4.8
+PyYAML>=6
+h5py>=3
+opencv-python-headless==4.11.0.86

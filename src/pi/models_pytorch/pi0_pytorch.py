@@ -4,6 +4,7 @@
 
 import math
 import logging
+from typing import cast
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -91,6 +92,11 @@ class PI0Pytorch(nn.Module):
         self.config = config
         self.pi05 = config.pi05
         self.use_task_embedding = bool(getattr(config, "use_task_embedding", False))
+        self.task_embedding_target = getattr(config, "task_embedding_target", "vlm")
+        self.state_conditioning_mode = getattr(config, "state_conditioning_mode", "discrete_vlm")
+        self.use_embodiment_embedding = bool(getattr(config, "use_embodiment_embedding", False))
+        self.num_embodiments = int(getattr(config, "num_embodiments", 2))
+        self.num_embodiment_tokens = int(getattr(config, "num_embodiment_tokens", 1))
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -102,11 +108,27 @@ class PI0Pytorch(nn.Module):
             precision=config.dtype,
         )
 
-        if self.use_task_embedding:
+        if self.use_task_embedding and self.task_embedding_target == "vlm":
             self.task_embedding = nn.Embedding(config.num_tasks, paligemma_config.width)
             nn.init.normal_(self.task_embedding.weight, std=paligemma_config.width**-0.5)
-            token_embedding = self.paligemma_with_expert.paligemma.language_model.embed_tokens
+            token_embedding = cast(nn.Embedding, self.paligemma_with_expert.paligemma.language_model.embed_tokens)
             self.task_embedding.to(dtype=token_embedding.weight.dtype)
+
+        if self.use_task_embedding and self.task_embedding_target == "expert":
+            self.expert_task_embedding = nn.Embedding(config.num_tasks, action_expert_config.width)
+            nn.init.normal_(self.expert_task_embedding.weight, std=action_expert_config.width**-0.5)
+
+        if self.use_embodiment_embedding:
+            self.embodiment_embedding = nn.Embedding(
+                self.num_embodiments * self.num_embodiment_tokens,
+                paligemma_config.width,
+            )
+            nn.init.normal_(self.embodiment_embedding.weight, std=paligemma_config.width**-0.5)
+            token_embedding = cast(nn.Embedding, self.paligemma_with_expert.paligemma.language_model.embed_tokens)
+            self.embodiment_embedding.to(dtype=token_embedding.weight.dtype)
+
+        if self.state_conditioning_mode == "dual":
+            self.expert_state_proj = nn.Linear(32, action_expert_config.width)
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
@@ -193,6 +215,7 @@ class PI0Pytorch(nn.Module):
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.task_index,
+            observation.embodiment_index,
             observation.state,
         )
 
@@ -210,6 +233,51 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
+    @staticmethod
+    def _prepare_task_indices(task_indices, *, batch_size: int, device: torch.device) -> torch.Tensor:
+        if task_indices is None:
+            raise ValueError("task_index is required when use_task_embedding=True")
+        if task_indices.ndim == 2 and task_indices.shape[1] == 1:
+            task_indices = task_indices[:, 0]
+        if task_indices.ndim != 1:
+            raise ValueError(f"Expected task_index shape [batch], got {tuple(task_indices.shape)}")
+        if task_indices.shape[0] != batch_size:
+            raise ValueError(f"task_index batch {task_indices.shape[0]} does not match batch {batch_size}")
+        return task_indices.to(device=device, dtype=torch.long)
+
+    def _embed_task_token(self, task_indices, embedding: nn.Embedding, *, batch_size: int, dtype) -> torch.Tensor:
+        indices = self._prepare_task_indices(
+            task_indices,
+            batch_size=batch_size,
+            device=embedding.weight.device,
+        )
+        task_emb = embedding(indices)[:, None, :] * math.sqrt(embedding.embedding_dim)
+        return task_emb.to(dtype=dtype)
+
+    def _embed_embodiment_tokens(self, embodiment_indices, *, batch_size: int, dtype) -> torch.Tensor:
+        if embodiment_indices is None:
+            raise ValueError("embodiment_index is required when use_embodiment_embedding=True")
+        if embodiment_indices.ndim == 2 and embodiment_indices.shape[1] == 1:
+            embodiment_indices = embodiment_indices[:, 0]
+        if embodiment_indices.ndim != 1:
+            raise ValueError(f"Expected embodiment_index shape [batch], got {tuple(embodiment_indices.shape)}")
+        if embodiment_indices.shape[0] != batch_size:
+            raise ValueError(f"embodiment_index batch {embodiment_indices.shape[0]} does not match batch {batch_size}")
+        embodiment_indices = embodiment_indices.to(
+            device=self.embodiment_embedding.weight.device,
+            dtype=torch.long,
+        )
+        if torch.any(embodiment_indices < 0) or torch.any(embodiment_indices >= self.num_embodiments):
+            raise ValueError(f"embodiment_index must be inside [0, {self.num_embodiments})")
+        token_offsets = torch.arange(
+            self.num_embodiment_tokens,
+            device=embodiment_indices.device,
+            dtype=torch.long,
+        )
+        lookup_indices = embodiment_indices[:, None] * self.num_embodiment_tokens + token_offsets[None, :]
+        embeddings = self.embodiment_embedding(lookup_indices) * math.sqrt(self.embodiment_embedding.embedding_dim)
+        return embeddings.to(dtype=dtype)
+
     def embed_prefix(
         self,
         images,
@@ -217,6 +285,7 @@ class PI0Pytorch(nn.Module):
         lang_tokens,
         lang_masks,
         task_indices=None,
+        embodiment_indices=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare.
 
@@ -225,6 +294,10 @@ class PI0Pytorch(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+
+        if not images:
+            raise ValueError("At least one image is required for the VLM prefix")
+        bsize = images[0].shape[0]
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
@@ -242,23 +315,32 @@ class PI0Pytorch(nn.Module):
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
 
-        if self.use_task_embedding:
-            if task_indices is None:
-                raise ValueError("task_index is required when use_task_embedding=True")
-            if task_indices.ndim == 2 and task_indices.shape[1] == 1:
-                task_indices = task_indices[:, 0]
-            if task_indices.ndim != 1:
-                raise ValueError(f"Expected task_index shape [batch], got {tuple(task_indices.shape)}")
-            if task_indices.shape[0] != bsize:
-                raise ValueError(
-                    f"task_index batch {task_indices.shape[0]} does not match image batch {bsize}"
-                )
-            task_emb = self.task_embedding(task_indices.to(dtype=torch.long))
-            task_emb = task_emb[:, None, :] * math.sqrt(task_emb.shape[-1])
-            task_emb = task_emb.to(dtype=embs[0].dtype)
+        if self.use_task_embedding and self.task_embedding_target == "vlm":
+            task_emb = self._embed_task_token(
+                task_indices,
+                self.task_embedding,
+                batch_size=bsize,
+                dtype=embs[0].dtype,
+            )
             embs.append(task_emb)
             pad_masks.append(torch.ones((bsize, 1), dtype=torch.bool, device=task_emb.device))
             att_masks.append(0)
+
+        if getattr(self, "use_embodiment_embedding", False):
+            embodiment_emb = self._embed_embodiment_tokens(
+                embodiment_indices,
+                batch_size=bsize,
+                dtype=embs[0].dtype,
+            )
+            embs.append(embodiment_emb)
+            pad_masks.append(
+                torch.ones(
+                    (bsize, self.num_embodiment_tokens),
+                    dtype=torch.bool,
+                    device=embodiment_emb.device,
+                )
+            )
+            att_masks += [0] * self.num_embodiment_tokens
 
         # Tokens contain normalized state and may also contain the language prompt.
         def lang_embed_func(lang_tokens):
@@ -285,11 +367,42 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
+    def embed_suffix(self, state, noisy_actions, timestep, task_indices=None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
         att_masks = []
+        bsize = noisy_actions.shape[0]
+        condition_block_started = False
+
+        if self.use_task_embedding and self.task_embedding_target == "expert":
+            task_emb = self._embed_task_token(
+                task_indices,
+                self.expert_task_embedding,
+                batch_size=bsize,
+                dtype=self.action_in_proj.weight.dtype,
+            )
+            embs.append(task_emb)
+            pad_masks.append(torch.ones((bsize, 1), dtype=torch.bool, device=task_emb.device))
+            att_masks.append(1)
+            condition_block_started = True
+
+        if self.state_conditioning_mode == "dual":
+            if state.dim() == 2:
+                state = state.unsqueeze(1)
+            if state.dim() != 3 or state.shape[1] != 1 or state.shape[2] != 32:
+                raise ValueError(
+                    f"Dual state conditioning expects state shape [batch, 1, 32], got {tuple(state.shape)}"
+                )
+
+            def expert_state_proj_func(current_state):
+                return self.expert_state_proj(current_state.to(dtype=self.expert_state_proj.weight.dtype))
+
+            state_emb = self._apply_checkpoint(expert_state_proj_func, state[:, :1, :])
+            embs.append(state_emb)
+            pad_masks.append(torch.ones((bsize, 1), dtype=torch.bool, device=state_emb.device))
+            att_masks.append(0 if condition_block_started else 1)
+            condition_block_started = True
 
         # Process state if:
         # 1. pi0 mode (not self.pi05), OR
@@ -333,17 +446,23 @@ class PI0Pytorch(nn.Module):
                     state_emb.shape[-1],  # hidden dimension
                     min_period=1.0,  # Adjusted for frame indices
                     max_period=float(history_frames),  # Max period based on history length
-                    device=device
+                    device=device,
                 )
                 # temporal_emb shape: (history_frames, hidden)
 
                 # Expand temporal embedding to match batch dimension and add to state embeddings
-                temporal_emb = temporal_emb.unsqueeze(0).expand(bsize, -1, -1)  # (1, history, hidden) -> (batch, history, hidden)
+                temporal_emb = temporal_emb.unsqueeze(0).expand(
+                    bsize, -1, -1
+                )  # (1, history, hidden) -> (batch, history, hidden)
                 state_emb = state_emb + temporal_emb.to(state_emb.dtype)
 
             # Apply Perceiver Resampler to compress historical states
             # from [batch, T=history_frames, hidden] to [batch, M=num_latents, hidden]
-            if self.pi05 and hasattr(self, 'perceiver_resampler') and history_frames > self.perceiver_resampler.num_latents:
+            if (
+                self.pi05
+                and hasattr(self, "perceiver_resampler")
+                and history_frames > self.perceiver_resampler.num_latents
+            ):
                 # Only apply compression if history_frames > num_latents
                 state_emb = self.perceiver_resampler(state_emb)
                 compressed_frames = self.perceiver_resampler.num_latents
@@ -361,7 +480,9 @@ class PI0Pytorch(nn.Module):
             # Set attention masks so that image and language inputs do not attend to state or actions
             # All state tokens can attend to each other (same cumsum value)
             # First state starts a new attention block, rest share the same block
-            att_masks += [1] + ([0] * (compressed_frames - 1)) if compressed_frames > 1 else [1]
+            first_state_mask = 0 if condition_block_started else 1
+            att_masks += [first_state_mask] + ([0] * (compressed_frames - 1))
+            condition_block_started = True
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
@@ -411,16 +532,15 @@ class PI0Pytorch(nn.Module):
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks)) # [batch_size, seq_len]
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks))  # [batch_size, seq_len]
 
         return embs, pad_masks, att_masks, adarms_cond
-
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)."""
         # 1. 预处理观测值
-        images, img_masks, lang_tokens, lang_masks, task_indices, state = self._preprocess_observation(
-            observation, train=True
+        images, img_masks, lang_tokens, lang_masks, task_indices, embodiment_indices, state = (
+            self._preprocess_observation(observation, train=True)
         )
         # print(f"state dtype: {state.dtype}, actions dtype: {actions.dtype}, images[0] dtype: {images[0].dtype}")
 
@@ -439,11 +559,11 @@ class PI0Pytorch(nn.Module):
 
         # 4. 编码前缀（图像 + 语言）
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, task_indices
+            images, img_masks, lang_tokens, lang_masks, task_indices, embodiment_indices
         )
 
         # 5. 编码后缀（状态 + 噪声动作 + 时间步）
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time, task_indices)
         # if (
         #     self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
         #     == torch.bfloat16
@@ -488,13 +608,13 @@ class PI0Pytorch(nn.Module):
             return F.linear(
                 suffix_out, self.action_out_proj.weight.to(dtype=dtype), self.action_out_proj.bias.to(dtype=dtype)
             )
+
         # 预测速度场
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         # 计算 MSE 损失: loss = ||u_t - v_t||²
         # 其中 u_t = noise - actions（真实速度场）
         return F.mse_loss(u_t, v_t, reduction="none")
-
 
     # @torch.compile
     @torch.no_grad()
@@ -506,18 +626,22 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, task_indices, state = self._preprocess_observation(
-            observation, train=False
+        images, img_masks, lang_tokens, lang_masks, task_indices, embodiment_indices, state = (
+            self._preprocess_observation(observation, train=False)
         )
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, task_indices
+            images, img_masks, lang_tokens, lang_masks, task_indices, embodiment_indices
         )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks) # [seq_len, seq_len] # [4, 968, 968]
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1 # 计算每个有效 token 的 位置 ID # [4, 968]
+        prefix_att_2d_masks = make_att_2d_masks(
+            prefix_pad_masks, prefix_att_masks
+        )  # [seq_len, seq_len] # [4, 968, 968]
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1  # 计算每个有效 token 的 位置 ID # [4, 968]
 
         # Compute image and language key value cache
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks) # [batch, 1, seq_len, seq_len] # [4, 1, 968, 968] # 这个 1 是 广播维度（broadcast dimension），会自动扩展到所有注意力头。 所有 8 个头使用相同的 mask
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(
+            prefix_att_2d_masks
+        )  # [batch, 1, seq_len, seq_len] # [4, 1, 968, 968] # 这个 1 是 广播维度（broadcast dimension），会自动扩展到所有注意力头。 所有 8 个头使用相同的 mask
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
@@ -527,7 +651,6 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
-
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -542,6 +665,7 @@ class PI0Pytorch(nn.Module):
                 past_key_values,
                 x_t,
                 expanded_time,
+                task_indices,
             )
 
             # Euler step - use new tensor assignment instead of in-place operation
@@ -556,9 +680,12 @@ class PI0Pytorch(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        task_indices=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, timestep, task_indices
+        )
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
@@ -569,7 +696,9 @@ class PI0Pytorch(nn.Module):
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
         # print(f"suffix_att_2d_masks.shape: {suffix_att_2d_masks.shape}")
 
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2) #[4, 10, 978] 10是action_horizon，978是prefix_len + suffix_len
+        full_att_2d_masks = torch.cat(
+            [prefix_pad_2d_masks, suffix_att_2d_masks], dim=2
+        )  # [4, 10, 978] 10是action_horizon，978是prefix_len + suffix_len
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 

@@ -52,3 +52,7 @@ memory_snapshot*
 
 dev/
 lion-vla-ckpt/
+
+# Local real-policy deployment inputs and acceptance artifacts
+configs/goai_real/*.local.*
+.tmp/

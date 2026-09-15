@@ -1,0 +1,25 @@
+# Used by pixi run serve_goai. Set checkpoint_path to the separately delivered checkpoint.
+# GOAI_SERVER_CONFIG may select a local override without editing this public template.
+policy_name: Lion_Pi05
+protocol: ws
+host: 127.0.0.1
+port: 6000
+# Omitted task_name: each episode must supply instruction/prompt/task_name.
+# Normalized exact match first, nearest match requires similarity >= 0.90.
+action_type: joint
+seed: 0
+checkpoint_path: ./checkpoints/real/step/ema
+device: cuda:0
+embodiment_index: 0
+execution_horizon: 8
+num_steps: 20
+compile_mode: reduce-overhead
+eval_batch: true
+# Opening ratios are dimensionless. Physical conversion belongs to the client.
+# Optional subtraction has no established hardware success guarantee.
+postprocess:
+  enabled: false
+  gripper:
+    squeeze: 0.05
+    squeeze_below: 0.90
+    per_task: {}

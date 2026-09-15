@@ -314,6 +314,8 @@ def preprocess_observation_pytorch(
 
     # Create a simple object with the required attributes instead of using the complex Observation class
     class SimpleProcessedObservation:
+        embodiment_index: torch.Tensor | None
+
         def __init__(self, **kwargs):
             for key, value in kwargs.items():
                 setattr(self, key, value)
@@ -323,6 +325,7 @@ def preprocess_observation_pytorch(
         image_masks=out_masks,
         state=observation.state,
         task_index=observation.task_index,
+        embodiment_index=observation.embodiment_index,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

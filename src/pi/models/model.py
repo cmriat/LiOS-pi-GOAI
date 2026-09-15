@@ -71,6 +71,7 @@ class Observation(Generic[ArrayT]):
 
     # 可选字段
     task_index: Optional[ArrayT] = None  # Learned task embedding lookup index.
+    embodiment_index: Optional[ArrayT] = None  # Learned robot embodiment lookup index.
     tokenized_prompt: Optional[ArrayT] = None  # 原: at.Int[ArrayT, "*b l"]
     tokenized_prompt_mask: Optional[ArrayT] = None  # 原: at.Bool[ArrayT, "*b l"]
     token_ar_mask: Optional[ArrayT] = None  # 原: at.Int[ArrayT, "*b l"]
@@ -95,6 +96,7 @@ class Observation(Generic[ArrayT]):
             image_masks=data["image_mask"],
             state=data["state"],
             task_index=data.get("task_index"),
+            embodiment_index=data.get("embodiment_index"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),

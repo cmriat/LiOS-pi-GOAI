@@ -1,5 +1,21 @@
 # GOAI 2026 双臂赛道提交
 
+## GOAI real-robot finals
+
+The six-task PiperX policy is available at [policy/Lion_Pi05](policy/Lion_Pi05/README.md). It uses the unchanged official XPolicyLab server and a separately delivered checkpoint.
+
+```bash
+pixi install --locked
+# Set checkpoint_path in configs/goai_real/server.yaml.
+# Keep the official XPolicyLab checkout beside this repository, or set GOAI_ROBODOJO.
+pixi run serve_goai
+```
+
+This is the real-robot entry. The simulation submission and its historical
+scores are documented below; they do not measure this policy's physical success.
+
+---
+
 > RoboDojo Generalization 维度 · 官方提交仓库
 > 本地 native 同口径评测：**Score 25.11 / SR 18.1%**；相对 2026-08-13 官方榜单快照第 1 名（23.55）高 **1.56 分**
 
