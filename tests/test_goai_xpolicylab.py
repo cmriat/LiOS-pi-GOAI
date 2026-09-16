@@ -419,6 +419,82 @@ class TestSqueeze:
             adapter.PostProcess({"postprocess": {"gripper_threshold": {}}})
 
 
+LIMITS = [[-2.617994, 2.617994], [0.0, 3.141593], [-2.96706, 0.0],
+          [-1.553344, 1.553344], [-1.553344, 1.553344], [-3.141593, 3.141593]]
+
+
+def _joint_steps(*, left=None, right=None):
+    """One action step with explicit arm joint targets (grippers at 0)."""
+    step = {
+        "left_arm_joint_state": np.asarray(left if left is not None else [0.0] * 6, np.float32),
+        "left_ee_joint_state": np.array([0.0], np.float32),
+        "right_arm_joint_state": np.asarray(right if right is not None else [0.0] * 6, np.float32),
+        "right_ee_joint_state": np.array([0.0], np.float32),
+    }
+    return [step]
+
+
+class TestJointClip:
+    """2026-09-16: a ~1.7 deg overshoot on J3 faulted a whole episode
+    (client validate_chunk rejects the chunk beyond 0.02 rad)."""
+
+    def test_absent_limits_leave_actions_alone(self):
+        pp = adapter.PostProcess({})
+        assert pp.joint_low is None and pp.joint_high is None
+        out = pp.joints(_joint_steps(right=[0.0, 0.0, 0.5, 0.0, 0.0, 0.0]))
+        assert out[0]["right_arm_joint_state"][2] == pytest.approx(0.5)
+
+    def test_clips_the_overshooting_joint_only(self):
+        pp = adapter.PostProcess({"joint_limits": LIMITS})
+        given = [0.1, 0.2, 0.029187, 0.3, 0.4, 0.5]
+        q = pp.joints(_joint_steps(right=given))[0]["right_arm_joint_state"]
+        assert q[2] == pytest.approx(0.0, abs=1e-7)          # J3 上限 = 0
+        for i, expected in enumerate(given):
+            if i != 2:
+                assert q[i] == pytest.approx(expected, abs=1e-7)
+
+    def test_lower_bound_also_enforced(self):
+        pp = adapter.PostProcess({"joint_limits": LIMITS})
+        out = pp.joints(_joint_steps(left=[0.0] * 6, right=[0.0, -0.05, 0.0, 0.0, 0.0, 0.0]))
+        assert out[0]["right_arm_joint_state"][1] == pytest.approx(0.0, abs=1e-7)
+
+    def test_counts_and_reports_the_worst_correction(self):
+        pp = adapter.PostProcess({"joint_limits": LIMITS})
+        pp.joints(_joint_steps(right=[0.0, -0.03, 0.029187, 0.0, 0.0, 0.0]))
+        assert pp.last_clipped == 2
+        assert pp.last_clip_max == pytest.approx(0.03, abs=1e-6)
+
+    def test_in_range_actions_report_zero(self):
+        # J3 的限位是 [-2.96706, 0],所以合法姿势里它必须是负的。
+        in_range = [0.1, 0.1, -0.1, 0.1, 0.1, 0.1]
+        pp = adapter.PostProcess({"joint_limits": LIMITS})
+        pp.joints(_joint_steps(left=in_range, right=in_range))
+        assert (pp.last_clipped, pp.last_clip_max) == (0, 0.0)
+
+    def test_dtype_preserved_and_input_not_mutated(self):
+        pp = adapter.PostProcess({"joint_limits": LIMITS})
+        steps = _joint_steps(right=[0.0, 0.0, 0.1, 0.0, 0.0, 0.0])
+        out = pp.joints(steps)
+        assert out[0]["right_arm_joint_state"].dtype == np.float32
+        assert steps[0]["right_arm_joint_state"][2] == pytest.approx(0.1)
+
+    def test_rejects_malformed_tables(self):
+        for bad in ([], [[0.0, 1.0]] * 5, [[0.0, 1.0]] * 7, "x", [[1.0, 0.0]] + [[0.0, 1.0]] * 5):
+            with pytest.raises(ValueError):
+                adapter.PostProcess({"joint_limits": bad})
+
+    def test_shipped_config_carries_the_sdk_table(self):
+        """server.yaml 的 joint_limits 必须与 SDK 实读值一致(见配置里的来源注释)。"""
+        import yaml
+
+        path = Path(__file__).resolve().parents[1] / "configs" / "goai_real" / "server.yaml"
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+        pp = adapter.PostProcess(cfg)
+        assert pp.joint_low is not None, "server.yaml 丢了 joint_limits"
+        assert list(pp.joint_low) == [row[0] for row in LIMITS]
+        assert list(pp.joint_high) == [row[1] for row in LIMITS]
+
+
 class TestRawStats:
     """Check deployment output statistics independently of postprocessing."""
 

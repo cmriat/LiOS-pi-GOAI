@@ -53,6 +53,7 @@ _STATE_KEYS = (
     ("right_ee_joint_state", 1),
 )
 _GRIPPER_KEYS = ("left_ee_joint_state", "right_ee_joint_state")
+_ARM_KEYS = ("left_arm_joint_state", "right_arm_joint_state")
 
 # Optional gripper subtraction in normalized opening units; disabled by default.
 DEFAULT_GRIPPER_SQUEEZE = 0.05
@@ -75,8 +76,11 @@ class PostProcess:
             raise ValueError(f"postprocess 段有未知字段 {unknown};可选: ['enabled', 'gripper']")
         self.enabled = bool(raw.get("enabled", False))
         self.squeeze, self.squeeze_below, self.per_task = self._load_gripper(raw.get("gripper"))
+        self.joint_low, self.joint_high = self._load_joint_limits(model_cfg.get("joint_limits"))
         self.last_squeezed = 0
         self.last_total = 0
+        self.last_clipped = 0
+        self.last_clip_max = 0.0
         self.reset_raw_stats()
 
     def reset_raw_stats(self):
@@ -96,6 +100,63 @@ class PostProcess:
         if not lo <= value <= hi:
             raise ValueError(f"{where} = {value} 越界,必须在 [{lo}, {hi}] 之间;units are normalized opening ratios")
         return value
+
+    @classmethod
+    def _load_joint_limits(cls, raw):
+        """Parse six [low, high] pairs from the arm SDK. Absent -> clipping is off.
+
+        The server environment has no pyAgxArm, so the table lives in server.yaml;
+        its provenance is recorded next to it there. Values are radians.
+        """
+        if raw is None:
+            return None, None
+        if not isinstance(raw, (list, tuple)) or len(raw) != 6:
+            raise ValueError("joint_limits 需要 6 组 [下限, 上限](弧度)")
+        low, high = [], []
+        for index, pair in enumerate(raw):
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError(f"joint_limits[{index}] 需要 [下限, 上限]")
+            try:
+                lo, hi = float(pair[0]), float(pair[1])
+            except (TypeError, ValueError):
+                raise ValueError(f"joint_limits[{index}] 必须是数字") from None
+            if not lo < hi:
+                raise ValueError(f"joint_limits[{index}] 下限必须小于上限: [{lo}, {hi}]")
+            low.append(lo)
+            high.append(hi)
+        return np.asarray(low, dtype=float), np.asarray(high, dtype=float)
+
+    def joints(self, actions):
+        """Clip arm joint targets into the SDK limits before they reach the client.
+
+        ``deploy/controller.py:validate_chunk`` rejects the **entire** chunk and faults
+        the episode when a joint target sits more than 0.02 rad outside the SDK limits,
+        so a ~1.7 degree overshoot stops the run. Clipping here keeps the model's
+        overshoot inside what the client tolerates.
+
+        The client stays the enforcer: a stale table here costs amplitude, it cannot
+        let an out-of-limit target through.
+        """
+        if self.joint_low is None:
+            self.last_clipped, self.last_clip_max = 0, 0.0
+            return list(actions)
+        out = []
+        clipped = 0
+        worst = 0.0
+        for step in actions:
+            new = dict(step)
+            for key in _ARM_KEYS:
+                source = np.asarray(step[key])
+                value = source.astype(float)
+                bounded = np.clip(value, self.joint_low, self.joint_high)
+                delta = np.abs(bounded - value)
+                if delta.max() > 0:
+                    clipped += int((delta > 0).sum())
+                    worst = max(worst, float(delta.max()))
+                new[key] = bounded.astype(source.dtype)
+            out.append(new)
+        self.last_clipped, self.last_clip_max = clipped, worst
+        return out
 
     @classmethod
     def _load_gripper(cls, raw):
@@ -426,6 +487,7 @@ class Model:
                     value = np.asarray(action[key])
                     if value.shape != (size,) or not np.isfinite(value).all():
                         raise RuntimeError(f"Backend returned invalid {key}")
+            actions = self.postprocess.joints(actions)
             amount = self.postprocess.squeeze_for(self._session(env_id).task_index)
             actions = self.postprocess.gripper(actions, amount)
             result.append(actions)
@@ -441,13 +503,18 @@ class Model:
         self._status_at = now
         latency = "—" if self._last_infer_ms is None else f"{self._last_infer_ms:.0f} ms"
         pp = self.postprocess
+        joint = ""
+        if pp.joint_low is not None:
+            joint = (f" | 关节限位裁剪 本批 {pp.last_clipped} 维"
+                     f"(最大 {pp.last_clip_max:.4f} rad)")
         gripper = ""
         raw = pp.raw_summary()
         if raw:
             state = f"已开启(下压 {pp.squeeze:g})" if pp.enabled else "未开启(仅统计)"
             gripper = f" | 夹爪后处理 {state},本批下压 {pp.last_squeezed}/{pp.last_total} | {raw}"
             pp.reset_raw_stats()  # 每个状态行窗口统计一次,不累加
-        logger.warning("运行状态 | 任务 %s | 最近一次推理 %s%s", self._last_task_note, latency, gripper)
+        logger.warning("运行状态 | 任务 %s | 最近一次推理 %s%s%s",
+                       self._last_task_note, latency, joint, gripper)
 
     def on_trial_end(self, result=None):
         """Release policy state; physical reset remains entirely with the evaluator."""

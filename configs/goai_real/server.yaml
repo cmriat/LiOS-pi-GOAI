@@ -8,12 +8,30 @@ port: 6000
 # Normalized exact match first, nearest match requires similarity >= 0.90.
 action_type: joint
 seed: 0
-checkpoint_path: ./checkpoints/real/step/ema
+checkpoint_path: /home/zhike/Projects/checkpoints/pi05_goai_joint/0916_exp4_dualstate_2171ep_step35000/ema
 device: cuda:0
 embodiment_index: 0
-execution_horizon: 8
-num_steps: 20
-compile_mode: reduce-overhead
+execution_horizon: 16
+num_steps: 50
+compile_mode: none
+
+# ==================== 关节限位（弧度）====================
+# 为什么在服务端写死:`deploy/controller.py:validate_chunk` 会拒掉整个 chunk 并进故障
+# 保持,只要某个关节目标超出 SDK 限位 0.02 rad 以上 —— 实测模型会超出约 1.7°,足以
+# 让整轮停住(2026-09-16 真机频繁出现)。服务端先裁,client 就看不到越界值。
+#
+# 来源:pyAgxArm 1.0.0  create_agx_arm_config(robot="piper_x", firmeware_version="v189")
+#       ["joint_limits"],2026-09-16 在本机实读核对(六个关节全部一致)。
+# server 的 env 里**没有** pyAgxArm(那是 client 的硬件 SDK),所以只能写在这里;
+# client 仍是最终守门人 —— 这张表过时了只会让动作幅度小一点,不会放过越界值。
+# 删掉这一段即关闭裁剪。
+joint_limits:
+  - [-2.617994,  2.617994]   # J1
+  - [ 0.0,       3.141593]   # J2  ← SDK 单边贴 0
+  - [-2.967060,  0.0]        # J3  ← SDK 单边贴 0
+  - [-1.553344,  1.553344]   # J4
+  - [-1.553344,  1.553344]   # J5
+  - [-3.141593,  3.141593]   # J6
 eval_batch: true
 # Opening ratios are dimensionless. Physical conversion belongs to the client.
 # Optional subtraction has no established hardware success guarantee.

@@ -17,6 +17,14 @@ from prepare_xpolicylab import install_policy
 from validate_xpolicylab import make_observation
 
 
+def check_endpoint_available(host: str, port: int) -> None:
+    """Check for a listener while allowing recently closed TCP connections."""
+    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET) as reservation:
+        # Match the official asyncio server's POSIX reuse of TIME_WAIT addresses.
+        reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        reservation.bind((host, port))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     root = Path(__file__).resolve().parents[3]
@@ -43,8 +51,10 @@ def main():
 
     bind_host = cfg.get("host", "127.0.0.1")
     # Refuse an occupied endpoint before attempting any warmup calls.
-    with socket.socket(socket.AF_INET6 if ":" in bind_host else socket.AF_INET) as reservation:
-        reservation.bind((bind_host, int(cfg["port"])))
+    try:
+        check_endpoint_available(bind_host, int(cfg["port"]))
+    except OSError as exc:
+        parser.error(f"Cannot bind policy server to {bind_host}:{cfg['port']}: {exc}")
     host = bind_host
     if host == "0.0.0.0":
         host = "127.0.0.1"
