@@ -87,15 +87,20 @@ def main():
     sys.path[:0] = [str(pi_root / "src"), str(bench), str(bench / "XPolicyLab")]
     if args.deps is not None:
         sys.path.insert(0, str(args.deps.expanduser().resolve()))
-    from XPolicyLab.policy.Lion_Pi05.model import Model
+    from XPolicyLab.policy.lionvla.model import Model
 
     config = json.loads(args.config.read_text())
     model = Model(config)
     from pi.inference.goai_xpolicylab import resolve_real_task
 
     task_index, task_instruction = resolve_real_task(config["task_name"])
-    if config.get("postprocess", {}).get("enabled", False):
-        raise ValueError("Parity acceptance requires postprocess disabled")
+    # 配置键从 postprocess.gripper 搬到了顶层 gripper: + per_task.<任务名>.gripper。
+    # 两处都显式查,不能靠 .get 默认值——搬完之后旧键取不到会静默通过。
+    if (config.get("gripper") or {}).get("enabled", False) or any(
+        (block.get("gripper") or {}).get("enabled", False)
+        for block in (config.get("per_task") or {}).values()
+    ):
+        raise ValueError("Parity acceptance requires the gripper correction disabled")
     obs = make_observation(task_instruction)
     # Independent canonical input, without calling the adapter's canonicalization.
     state = np.concatenate(

@@ -32,8 +32,13 @@ def main():
     out = args.output.expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     cfg = yaml.safe_load(args.config.read_text())
-    if cfg.get("postprocess", {}).get("enabled", False):
-        raise ValueError("Startup acceptance requires disabled postprocessing")
+    # 配置键从 postprocess.gripper 搬到了顶层 gripper: + per_task.<任务名>.gripper。
+    # 两处都显式查,不能靠 .get 默认值——搬完之后旧键取不到会静默通过。
+    if (cfg.get("gripper") or {}).get("enabled", False) or any(
+        (block.get("gripper") or {}).get("enabled", False)
+        for block in (cfg.get("per_task") or {}).values()
+    ):
+        raise ValueError("Startup acceptance requires the gripper correction disabled")
     cfg.pop("task_name", None)
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
@@ -88,8 +93,11 @@ def main():
                     client.call("update_obs", make_observation(instruction))
                     began = time.monotonic()
                     actions = client.call("get_action")
-                    if len(actions) != cfg.get("execution_horizon", 8):
-                        raise AssertionError("Unexpected action horizon")
+                    from pi.inference.goai_xpolicylab import execution_horizon_for_task
+
+                    expected = execution_horizon_for_task(cfg, instruction)
+                    if len(actions) != expected:
+                        raise AssertionError(f"Unexpected action horizon for {instruction!r}: {len(actions)} != {expected}")
                     for action in actions:
                         if set(action) != {
                             "left_arm_joint_state",

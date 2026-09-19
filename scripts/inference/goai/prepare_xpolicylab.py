@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the Lion_Pi05 plugin and generate a portable real-policy configuration."""
+"""Install the lionvla plugin and generate a portable real-policy configuration."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ def install_policy(bench):
     xpl = Path(bench).expanduser().resolve() / "XPolicyLab"
     if not (xpl / "setup_policy_server.py").is_file():
         raise FileNotFoundError("Expected the official XPolicyLab checkout inside --robodojo")
-    source = ROOT / "policy/Lion_Pi05"
-    destination = xpl / "policy/Lion_Pi05"
+    source = ROOT / "policy/lionvla"
+    destination = xpl / "policy/lionvla"
     if destination.is_symlink() and destination.resolve() == source:
         return destination
     if destination.exists() or destination.is_symlink():
@@ -45,7 +45,7 @@ def main():
         parser.error("Invalid port, execution horizon or denoising steps")
     checkpoint, _ = validate_checkpoint(args.checkpoint)
     config = dict(
-        policy_name="Lion_Pi05",
+        policy_name="lionvla",
         protocol="ws",
         host=args.host,
         port=args.port,
@@ -58,7 +58,7 @@ def main():
         num_steps=args.num_steps,
         compile_mode=args.compile_mode,
         eval_batch=True,
-        postprocess={"enabled": False},
+        gripper={"enabled": False},
     )
     if args.task:
         resolve_real_task(args.task)

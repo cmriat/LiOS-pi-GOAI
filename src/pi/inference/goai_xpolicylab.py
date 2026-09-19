@@ -17,10 +17,11 @@ from pi.shared.goai_tasks import (
     normalize_task_instruction,
 )
 from pi.inference.goai_helpers import load_checkpoint_manifest, resolve_checkpoint_config_name
+from pi.inference.goai_trace import TraceWriter
 
 logger = logging.getLogger(__name__)
 
-_STATUS_INTERVAL_S = 60.0
+_STATUS_INTERVAL_S = 2.0
 
 # Reject unrelated phrases even when a nearest candidate exists.
 _NEAREST_MIN_RATIO = 0.90
@@ -62,20 +63,39 @@ _SQUEEZE_HARD_RANGE = (0.0, 0.5)
 _PROBE_THRESHOLDS = (0.25, 0.50, 0.75, 0.90, 0.95)
 
 
+def execution_horizon_for_task(model_cfg, task_instruction):
+    """该任务的执行块长度:per_task 覆盖优先,否则全局 execution_horizon。
+
+    给服务端之外的调用方(预热、验收脚本)用,避免它们各自硬编码全局值。
+    task_instruction 可以是官方整句、短名或下划线 slug —— 一律归一到 task_index 再比,
+    因为同一个任务的多种写法归一化后仍是不同的键(如 insert charger / Insert the charger)。
+    """
+    default = _integer(model_cfg.get("execution_horizon", 8), "execution_horizon", 1)
+    per_task = model_cfg.get("per_task") or {}
+    if not per_task:
+        return default
+    key = normalize_task_instruction(task_instruction)
+    if key not in _TASKS:
+        return default
+    target = _TASKS[key][0]
+    for name, block in per_task.items():
+        alias = normalize_task_instruction(name)
+        if alias in _TASKS and _TASKS[alias][0] == target:
+            return _integer(block.get("execution_horizon", default), f"per_task.{name}.execution_horizon", 1)
+    return default
+
+
 class PostProcess:
     """Optional server-side corrections to model actions."""
 
-    def __init__(self, model_cfg):
-        raw = model_cfg.get("postprocess")
-        if raw is None:
-            raw = {}
-        if not isinstance(raw, Mapping):
-            raise ValueError("postprocess 段必须是 map")
-        unknown = sorted(set(raw) - {"gripper", "enabled"})
-        if unknown:
-            raise ValueError(f"postprocess 段有未知字段 {unknown};可选: ['enabled', 'gripper']")
-        self.enabled = bool(raw.get("enabled", False))
-        self.squeeze, self.squeeze_below, self.per_task = self._load_gripper(raw.get("gripper"))
+    def __init__(self, model_cfg, per_task_gripper=None):
+        if model_cfg.get("postprocess") is not None:
+            raise ValueError(
+                "postprocess 段已废弃:夹爪配置移到顶层 gripper:,按任务覆盖移到 per_task.<任务名>.gripper"
+            )
+        self.enabled, self.squeeze, self.squeeze_below = self._load_gripper(model_cfg.get("gripper"))
+        # {task_index: (enabled, squeeze, squeeze_below)},由 Model 解析 per_task 段后传入。
+        self.per_task = dict(per_task_gripper or {})
         self.joint_low, self.joint_high = self._load_joint_limits(model_cfg.get("joint_limits"))
         self.last_squeezed = 0
         self.last_total = 0
@@ -159,36 +179,40 @@ class PostProcess:
         return out
 
     @classmethod
-    def _load_gripper(cls, raw):
+    def _load_gripper(cls, raw, where="gripper"):
         if raw is None:
             raw = {}
         if not isinstance(raw, Mapping):
-            raise ValueError("postprocess.gripper 必须是 map")
-        unknown = sorted(set(raw) - {"squeeze", "squeeze_below", "per_task"})
+            raise ValueError(f"{where} 必须是 map")
+        unknown = sorted(set(raw) - {"enabled", "squeeze", "squeeze_below"})
         if unknown:
-            raise ValueError(f"postprocess.gripper 有未知字段 {unknown};可选: ['squeeze', 'squeeze_below', 'per_task']")
-        squeeze = cls._check_squeeze(raw.get("squeeze", DEFAULT_GRIPPER_SQUEEZE), "postprocess.gripper.squeeze")
+            raise ValueError(f"{where} 有未知字段 {unknown};可选: ['enabled', 'squeeze', 'squeeze_below']")
+        enabled = raw.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"{where}.enabled 必须是布尔")
+        squeeze = cls._check_squeeze(raw.get("squeeze", DEFAULT_GRIPPER_SQUEEZE), f"{where}.squeeze")
         try:
             below = float(raw.get("squeeze_below", DEFAULT_GRIPPER_SQUEEZE_BELOW))
         except (TypeError, ValueError):
-            raise ValueError("postprocess.gripper.squeeze_below 必须是数字") from None
+            raise ValueError(f"{where}.squeeze_below 必须是数字") from None
         if not 0.5 <= below <= 1.0:
             raise ValueError(
-                "postprocess.gripper.squeeze_below 需要在 [0.5, 1.0];"
+                f"{where}.squeeze_below 需要在 [0.5, 1.0];"
                 "低于 0.5 会把大量过渡帧也下压,高于 1.0 等于一直下压"
             )
-        per_task = {}
-        for name, value in (raw.get("per_task") or {}).items():
-            key = normalize_task_instruction(name)
-            if key not in _TASKS:
-                raise ValueError(f"postprocess.gripper.per_task 里的 {name!r} 不是已知任务;可选: {sorted(_SLUGS)}")
-            per_task[_TASKS[key][0]] = cls._check_squeeze(value, f"postprocess.gripper.per_task.{name}")
-        return squeeze, below, per_task
+        return enabled, squeeze, below
+
+    def spec_for(self, task_index):
+        """本任务生效的 (enabled, squeeze, squeeze_below);没有按任务覆盖就用全局。"""
+        if task_index is not None and int(task_index) in self.per_task:
+            return self.per_task[int(task_index)]
+        return self.enabled, self.squeeze, self.squeeze_below
 
     def squeeze_for(self, task_index):
-        return self.per_task.get(task_index, self.squeeze)
+        """本任务配置的下压量(不含 enabled 门;是否生效由 gripper() 的 enabled 决定)。"""
+        return self.spec_for(task_index)[1]
 
-    def gripper(self, actions, amount):
+    def gripper(self, actions, amount, below=None, enabled=None):
         """Subtract the requested opening ratio below the configured threshold."""
         raw = [float(np.asarray(step[key]).reshape(-1)[0]) for step in actions for key in _GRIPPER_KEYS]
         for value in raw:
@@ -199,7 +223,7 @@ class PostProcess:
             for probe in _PROBE_THRESHOLDS:
                 if value >= probe:
                     self._raw_over[probe] += 1
-        if not self.enabled or amount <= 0:
+        if not (self.enabled if enabled is None else enabled) or amount <= 0:
             self.last_squeezed = self.last_total = 0
             return list(actions)
         out = []
@@ -208,7 +232,7 @@ class PostProcess:
             new = dict(step)
             for key in _GRIPPER_KEYS:
                 source = np.asarray(step[key])
-                limit = source.dtype.type(self.squeeze_below)
+                limit = source.dtype.type(self.squeeze_below if below is None else below)
                 value = source.reshape(-1)[0]
                 if value < limit:
                     value = max(source.dtype.type(0.0), value - source.dtype.type(amount))
@@ -355,6 +379,25 @@ class Model:
         if self.execution_horizon > 32:
             raise ValueError("execution_horizon cannot exceed the trained horizon 32")
         num_steps = _integer(model_cfg.get("num_steps", 20), "num_steps", 1)
+        self.num_steps = num_steps
+        # 按任务覆盖:任务名 -> task_index,启动时校验;不写的任务走上面的全局默认。
+        self.per_task_names, self.per_task = self._parse_per_task(model_cfg.get("per_task"))
+        self.execution_horizon_by_task: dict[int, int] = {}
+        self.num_steps_by_task: dict[int, int] = {}
+        for task_index, block in self.per_task.items():
+            where = f"per_task.{self.per_task_names[task_index]}"
+            horizon = _integer(block.get("execution_horizon", self.execution_horizon), f"{where}.execution_horizon", 1)
+            if horizon > 32:
+                raise ValueError(f"{where}.execution_horizon cannot exceed the trained horizon 32")
+            steps = _integer(block.get("num_steps", num_steps), f"{where}.num_steps", 1)
+            self.execution_horizon_by_task[task_index] = horizon
+            self.num_steps_by_task[task_index] = steps
+        per_task_gripper = {}
+        for task_index, block in self.per_task.items():
+            if "gripper" in block:
+                per_task_gripper[task_index] = PostProcess._load_gripper(
+                    block["gripper"], where=f"per_task.{self.per_task_names[task_index]}.gripper"
+                )
         if model_cfg.get("embodiment_index", 0) != 0:
             raise ValueError("This policy serves only the trained real-data embodiment index 0")
         checkpoint, stats = validate_checkpoint(model_cfg["checkpoint_path"])
@@ -373,9 +416,44 @@ class Model:
             apply_delta=True,
             seed=self.seed,
             strict_checkpoint=True,
+            action_resample=model_cfg.get("action_resample"),
+            task_settings={
+                task_index: {
+                    "execution_horizon": self.execution_horizon_by_task[task_index],
+                    "num_steps": self.num_steps_by_task[task_index],
+                    "action_resample": self.per_task[task_index].get(
+                        "action_resample", model_cfg.get("action_resample")
+                    ),
+                }
+                for task_index in self.per_task
+            },
         )
         self.model = self.policy.model
-        self.postprocess = PostProcess(model_cfg)
+        self.postprocess = PostProcess(model_cfg, per_task_gripper=per_task_gripper)
+        self.trace = TraceWriter(model_cfg)
+        resamplers = getattr(self.policy, "_resamplers", None) or {}
+        summary = {
+            ("global" if key is None else self.per_task_names.get(key, str(key))): value.summary()
+            for key, value in resamplers.items()
+            if getattr(value, "enabled", False)
+        }
+        resample_meta = {"action_resample": summary} if summary else {}
+        if summary:
+            logger.warning("Action resampling configured: %s", summary)
+        if self.per_task:
+            logger.warning("Per-task overrides: %s", self.per_task_summary())
+        self.trace.write_meta(
+            {
+                "policy_name": model_cfg.get("policy_name"),
+                "checkpoint_path": str(model_cfg.get("checkpoint_path")),
+                "execution_horizon": model_cfg.get("execution_horizon"),
+                "num_steps": model_cfg.get("num_steps"),
+                "per_task": self.per_task_summary(),
+                **resample_meta,
+            }
+        )
+        self._raw_obs = {}
+        self._obs_at = {}
         self._last_task_note = "尚未收到观测"
         self._last_infer_ms = None
         self._status_at = None
@@ -393,9 +471,13 @@ class Model:
         self._sessions = {}
         self._episode_task = {}
         self._latest_ids = []
+        self._raw_obs = {}
+        self._obs_at = {}
+        self.trace.event("reset")
 
     def prepare_case(self, case_meta=None):
         """Validate a declared task; episode observations select the actual session task."""
+        self.trace.event("prepare_case", {"case_meta": case_meta})
         if isinstance(case_meta, Mapping) and case_meta.get("task_name") is not None:
             resolve_real_task_nearest(case_meta["task_name"])
 
@@ -435,8 +517,14 @@ class Model:
             if not isinstance(obs, Mapping):
                 raise ValueError("Observation must be a mapping")
             env_id = _integer(obs.get("env_idx", position), "env_idx")
+            self._obs_at[env_id] = time.perf_counter()  # 观测到达时刻，用于算端到端
             if env_id in pending:
                 raise ValueError(f"Duplicate env_idx {env_id}")
+            self._raw_obs[env_id] = {
+                "fields": {f: obs.get(f) for f in ("instruction", "prompt", "task_name") if obs.get(f) is not None},
+                "keys": sorted(str(k) for k in obs.keys()),
+                "images_preprocessed": obs.get("images_preprocessed"),
+            }
             tasks[env_id] = self._resolve_observation_task(obs)
             session = self._sessions.get(env_id)
             if session is not None and session.task_index != tasks[env_id][0]:
@@ -448,6 +536,58 @@ class Model:
         self._observations = pending
         self._episode_task = tasks
         self._latest_ids = list(pending)
+
+    @staticmethod
+    def _parse_per_task(raw):
+        """per_task 段 -> (任务名表, {task_index: 覆盖块});未知任务名/字段启动即报错。"""
+        if raw is None:
+            return {}, {}
+        if not isinstance(raw, Mapping):
+            raise ValueError("per_task 段必须是 map")
+        names, parsed = {}, {}
+        for name, block in raw.items():
+            key = normalize_task_instruction(name)
+            if key not in _TASKS:
+                raise ValueError(f"per_task 里的 {name!r} 不是已知任务;可选: {sorted(_SLUGS)}")
+            if not isinstance(block, Mapping):
+                raise ValueError(f"per_task.{name} 必须是 map")
+            unknown = sorted(set(block) - {"execution_horizon", "num_steps", "action_resample", "gripper"})
+            if unknown:
+                raise ValueError(
+                    f"per_task.{name} 有未知字段 {unknown};"
+                    "可选: ['execution_horizon', 'num_steps', 'action_resample', 'gripper']"
+                )
+            task_index = _TASKS[key][0]
+            if task_index in parsed:
+                raise ValueError(f"per_task 里 {name!r} 与另一个别名指向同一个任务,只能写一次")
+            names[task_index] = name
+            parsed[task_index] = dict(block)
+        return names, parsed
+
+    def execution_horizon_for(self, task_index):
+        """本任务的执行块长度;没有按任务覆盖就用全局。"""
+        if task_index is None:
+            return self.execution_horizon
+        return self.execution_horizon_by_task.get(int(task_index), self.execution_horizon)
+
+    def num_steps_for(self, task_index):
+        if task_index is None:
+            return self.num_steps
+        return self.num_steps_by_task.get(int(task_index), self.num_steps)
+
+    def per_task_summary(self):
+        """人读的按任务覆盖表,写进 meta.json / 启动日志。"""
+        if not self.per_task:
+            return None
+        return {
+            self.per_task_names[task_index]: {
+                "execution_horizon": self.execution_horizon_by_task[task_index],
+                "num_steps": self.num_steps_by_task[task_index],
+                **({"action_resample": block["action_resample"]} if "action_resample" in block else {}),
+                **({"gripper": block["gripper"]} if "gripper" in block else {}),
+            }
+            for task_index, block in self.per_task.items()
+        }
 
     def _session(self, env_id):
         if env_id not in self._sessions:
@@ -466,6 +606,9 @@ class Model:
         return self.get_action_batch(self._latest_ids)[0]
 
     def get_action_batch(self, env_idx_list=None):
+        # 本次调用【到达】服务端的时刻。它与 update_obs 的到达时刻之差，就是客户端
+        # 两次调用之间的间隔（含网络往返与客户端自身处理），即我们要的端到端延迟。
+        called_at = time.perf_counter()
         if env_idx_list is None:
             ids = self._latest_ids
         else:
@@ -477,8 +620,13 @@ class Model:
         began = time.perf_counter()
         result = []
         for env_id in ids:
+            infer_began = time.perf_counter()
             actions = self.policy.infer(self._observations[env_id], self._session(env_id))
-            if len(actions) != self.execution_horizon:
+            # wall_ms is measured here, so it stays meaningful even for a backend
+            # that reports no stage breakdown of its own.
+            timing = dict(getattr(self.policy, "last_timing", None) or {})
+            timing["wall_ms"] = (time.perf_counter() - infer_began) * 1000.0
+            if len(actions) != self.execution_horizon_for(self._session(env_id).task_index):
                 raise RuntimeError("Backend returned an unexpected action horizon")
             for action in actions:
                 if set(action) != {key for key, _ in _STATE_KEYS}:
@@ -488,35 +636,44 @@ class Model:
                     if value.shape != (size,) or not np.isfinite(value).all():
                         raise RuntimeError(f"Backend returned invalid {key}")
             actions = self.postprocess.joints(actions)
-            amount = self.postprocess.squeeze_for(self._session(env_id).task_index)
-            actions = self.postprocess.gripper(actions, amount)
+            squeeze_enabled, amount, below = self.postprocess.spec_for(self._session(env_id).task_index)
+            actions = self.postprocess.gripper(actions, amount, below=below, enabled=squeeze_enabled)
+            infer_ms = timing.get("wall_ms")
+            if infer_ms is None:
+                infer_ms = (time.perf_counter() - began) * 1000.0
+            obs_at = self._obs_at.get(env_id)
+            e2e_ms = None if obs_at is None else (called_at - obs_at) * 1000.0
+            resample_status = getattr(self.policy, "last_resample", None)
+            if resample_status is not None:
+                logger.warning("Action resampling env=%s: %s", env_id, resample_status)
+            self.trace.record(
+                env_id=env_id,
+                task_index=self._session(env_id).task_index,
+                obs=self._observations[env_id],
+                actions=actions,
+                raw=self._raw_obs.get(env_id),
+                timing=timing,
+                infer_ms=infer_ms,
+                e2e_ms=e2e_ms,
+                action_resample=resample_status,
+            )
+            self._last_infer_ms = infer_ms
+            self._log_call(e2e_ms)
             result.append(actions)
-        self._last_infer_ms = (time.perf_counter() - began) * 1000.0
-        self._log_status()
         return result
 
-    def _log_status(self):
-        """Periodically report task selection, inference latency and raw gripper statistics."""
-        now = time.monotonic()
-        if self._status_at is not None and now - self._status_at < _STATUS_INTERVAL_S:
-            return
-        self._status_at = now
+    def _log_call(self, e2e_ms=None):
+        """One line per inference: task (prompt + slot id) and both latencies.
+
+        infer_ms = 模型前向本身；e2e_ms = 客户端两次调用（update_obs → get_action）
+        到达服务端的间隔——含网络往返与客户端自身处理，**不含服务端推理**。
+        两者相加 ≈ 客户端从发出观测到收到动作的全部等待（仍不含动作回包的返程网络）。
+        """
         latency = "—" if self._last_infer_ms is None else f"{self._last_infer_ms:.0f} ms"
-        pp = self.postprocess
-        joint = ""
-        if pp.joint_low is not None:
-            joint = (f" | 关节限位裁剪 本批 {pp.last_clipped} 维"
-                     f"(最大 {pp.last_clip_max:.4f} rad)")
-        gripper = ""
-        raw = pp.raw_summary()
-        if raw:
-            state = f"已开启(下压 {pp.squeeze:g})" if pp.enabled else "未开启(仅统计)"
-            gripper = f" | 夹爪后处理 {state},本批下压 {pp.last_squeezed}/{pp.last_total} | {raw}"
-            pp.reset_raw_stats()  # 每个状态行窗口统计一次,不累加
-        logger.warning("运行状态 | 任务 %s | 最近一次推理 %s%s%s",
-                       self._last_task_note, latency, joint, gripper)
+        tail = "" if e2e_ms is None else f" | 端到端 {e2e_ms:.0f} ms"
+        logger.warning("[推理] %s | 推理 %s%s", self._last_task_note, latency, tail)
 
     def on_trial_end(self, result=None):
         """Release policy state; physical reset remains entirely with the evaluator."""
-        del result
+        self.trace.event("trial_end", {"result": result})
         self.reset()

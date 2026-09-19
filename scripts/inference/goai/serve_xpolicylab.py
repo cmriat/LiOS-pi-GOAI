@@ -42,8 +42,8 @@ def main():
     bench = args.robodojo.expanduser().resolve()
     config = args.config.expanduser().resolve()
     cfg = yaml.safe_load(config.read_text())
-    if cfg.get("policy_name") != "Lion_Pi05" or cfg.get("protocol", "ws") != "ws":
-        parser.error("Expected Lion_Pi05 with the official ws protocol")
+    if cfg.get("policy_name") != "lionvla" or cfg.get("protocol", "ws") != "ws":
+        parser.error("Expected lionvla with the official ws protocol")
     install_policy(bench)
     sys.path[:0] = [str(bench), str(bench / "XPolicyLab")]
     from websockets.sync.client import connect
@@ -55,6 +55,9 @@ def main():
         check_endpoint_available(bind_host, int(cfg["port"]))
     except OSError as exc:
         parser.error(f"Cannot bind policy server to {bind_host}:{cfg['port']}: {exc}")
+    # `url` stays the loopback endpoint: it is what the readiness probe and the
+    # synthetic warmup actually dial, and a NAT'd public address would not
+    # necessarily hairpin back.
     host = bind_host
     if host == "0.0.0.0":
         host = "127.0.0.1"
@@ -62,6 +65,12 @@ def main():
         host = "::1"
     host = f"[{host}]" if ":" in host else host
     url = f"ws://{host}:{cfg['port']}"
+    # `display_url` is for the operator's eyes only: when bound to all
+    # interfaces it names the address the on-site client must dial.
+    display_host = cfg.get("public_host") if bind_host in ("0.0.0.0", "::") else bind_host
+    display_host = str(display_host) if display_host else host.strip("[]")
+    display_host = f"[{display_host}]" if ":" in display_host else display_host
+    display_url = f"ws://{display_host}:{cfg['port']}"
     server = subprocess.Popen(
         [
             sys.executable,
@@ -106,20 +115,28 @@ def main():
             close_timeout_s=2,
         )
         client.call("reset")
-        obs = make_observation(cfg.get("task_name") or "Insert the charger")
+        warmup_task = cfg.get("task_name") or "Insert the charger"
+        obs = make_observation(warmup_task)
+        # 预热观测同样会命中 per_task 覆盖,期望长度必须用同一套任务名归一化来解析,
+        # 否则给预热任务(默认 Insert the charger)配了 execution_horizon 就会误报启动失败。
+        from pi.inference.goai_xpolicylab import execution_horizon_for_task
+
+        expected_horizon = execution_horizon_for_task(cfg, warmup_task)
         for _ in range(args.warmup_rounds):
             client.call("update_obs", obs)
             began = time.monotonic()
             actions = client.call("get_action")
-            if len(actions) != cfg.get("execution_horizon", 8):
-                raise RuntimeError("Warmup returned an unexpected action horizon")
+            if len(actions) != expected_horizon:
+                raise RuntimeError(
+                    f"Warmup returned an unexpected action horizon: got {len(actions)}, want {expected_horizon}"
+                )
             elapsed = (time.monotonic() - began) * 1000
         client.call("reset")
         client.close()
         client = None
         if server.poll() is not None:
             raise RuntimeError("Server exited during warmup")
-        print(f"READY FOR INFERENCE {url}; synthetic warmup last call {elapsed:.1f} ms", flush=True)
+        print(f"READY FOR INFERENCE {display_url}; synthetic warmup last call {elapsed:.1f} ms", flush=True)
         print("Physical observations and each new task may incur additional compilation.", flush=True)
         raise SystemExit(server.wait())
     finally:

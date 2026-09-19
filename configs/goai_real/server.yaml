@@ -1,30 +1,118 @@
-# Used by pixi run serve_goai. Set checkpoint_path to the separately delivered checkpoint.
-# GOAI_SERVER_CONFIG may select a local override without editing this public template.
-policy_name: Lion_Pi05
+# =====================================================================
+# GOAI 决赛 · 策略服务端配置   （pixi run serve_goai 读的就是这份）
+#
+# 所有参数在【启动时读取一次】—— 改完必须重启服务才生效。
+# 现场唯一需要动的区域是第 2 节（全局默认 + 按任务覆盖），两小节挨着放，
+# 方便左右对照着改。
+# =====================================================================
+
+
+# ---------------------------------------------------------------------
+# 1. 服务身份与绑定
+# ---------------------------------------------------------------------
+policy_name: lionvla
 protocol: ws
-host: 127.0.0.1
+
+# 0.0.0.0 绑所有网卡，现场 client 才连得进来；
+# 内部预热仍走 loopback，不受影响。
+host: 0.0.0.0
+
+# 只用于 READY 那行显示给现场工程师看。本机在 NAT 后面，公网地址不在任何网卡上，
+# 探测不到，所以手写。纯显示，服务自己从不拨它。
+# 本机公网地址。公开仓库留占位符；部署时改成真实值，或用 gitignore 的
+# configs/goai_real/server.local.yaml + GOAI_SERVER_CONFIG 覆盖。
+public_host: "<PUBLIC_HOST_OR_IP>"
 port: 6000
-# Omitted task_name: each episode must supply instruction/prompt/task_name.
-# Normalized exact match first, nearest match requires similarity >= 0.90.
+
+# 故意不写 task_name：每局必须由 client 提供 instruction/prompt/task_name。
+# 匹配规则：先归一化精确匹配，退化到最近邻时要求相似度 >= 0.90。
 action_type: joint
 seed: 0
-checkpoint_path: /home/zhike/Projects/checkpoints/pi05_goai_joint/0916_exp4_dualstate_2171ep_step35000/ema
+
+# 交付的 checkpoint 目录（其 ema/ 子目录）。公开仓库留占位符。
+checkpoint_path: /path/to/checkpoints/<experiment>/ema
 device: cuda:0
 embodiment_index: 0
+compile_mode: none
+eval_batch: true
+
+
+# ---------------------------------------------------------------------
+# 2. 调参 · 全局默认
+#
+#    一个 chunk 返回 execution_horizon 个动作，客户端按固定步率放完后
+#    再要下一块；每块之间要等一次推理。num_steps 是去噪步数。
+#    这两个都【不改变】每单位运动消耗的 step 预算 —— 超时看的是 step。
+# ---------------------------------------------------------------------
 execution_horizon: 16
 num_steps: 50
-compile_mode: none
 
-# ==================== 关节限位（弧度）====================
-# 为什么在服务端写死:`deploy/controller.py:validate_chunk` 会拒掉整个 chunk 并进故障
-# 保持,只要某个关节目标超出 SDK 限位 0.02 rad 以上 —— 实测模型会超出约 1.7°,足以
-# 让整轮停住(2026-09-16 真机频繁出现)。服务端先裁,client 就看不到越界值。
+# 动作重采样：把更长的预测跨度压进同样多的输出步数 = 同一段轨迹播放得更快。
+# 压缩比 = source_horizon / execution_horizon。只压缩，不能拉伸。
+#   enabled        false 时严格返回 actions[:execution_horizon]，与旧路径逐位一致
+#   source_horizon 取值范围 [execution_horizon, 模型预测horizon]
+#   gripper_guard  本 chunk 内任一夹爪跨度超过它 -> 本块不压缩（Ilya 规则，建议保留）
+#                   实测约 1/4 的块会触发（就是抓取/释放那几下），只损失 5% 压缩收益
+#   max_step_rad   相邻步关节变化上限，超过则不压缩；null 表示关掉该守卫
+action_resample:
+  enabled: false
+  source_horizon: 20
+  gripper_guard: 0.2
+  max_step_rad: 0.10
+
+# 夹爪下压修正（在发给客户端的值上减去一个开合量）。
+# enabled 默认 false：漏写不许悄悄改变机械臂行为。
+#   squeeze       要减掉的开合量，硬校验 [0.0, 0.5]
+#   squeeze_below 只对【小于】它的夹爪值生效，硬校验 [0.5, 1.0]
+#   注意：squeeze_below 只有上界。要"只压充电线缆带 0.05-0.10 而不动充电头带
+#   0.30-0.36"需要下界，当前代码不支持（见 INFERENCE_TRICKS_DESIGN §T3 方案A）。
+gripper:
+  enabled: false
+  squeeze: 0.05
+  squeeze_below: 0.90
+
+
+# ---------------------------------------------------------------------
+# 2b. 调参 · 按任务覆盖   （不写的任务走上面第 2 节的全局默认）
 #
-# 来源:pyAgxArm 1.0.0  create_agx_arm_config(robot="piper_x", firmeware_version="v189")
-#       ["joint_limits"],2026-09-16 在本机实读核对(六个关节全部一致)。
-# server 的 env 里**没有** pyAgxArm(那是 client 的硬件 SDK),所以只能写在这里;
-# client 仍是最终守门人 —— 这张表过时了只会让动作幅度小一点,不会放过越界值。
+# 键写【任务名】—— 官方整句、短名或下划线都认：
+#   insert charger / Insert the charger / insert_charger  等价
+# 可覆盖字段：execution_horizon / num_steps / action_resample / gripper
+# 未知任务名、未知字段、非法取值都在【启动时】报错并列出可选值，不会静默失效。
+# 每任务的最终取值会写进该次运行的 meta.json，回看历史 run 时能知道当时跑的是什么。
+#
+# 调参纪律：一次只动一个任务的一个旋钮。每个任务只有 10 次试验，
+# 小于 ~2 分的差异分不出是效果还是噪声。
+# ---------------------------------------------------------------------
+per_task: {}
+
+# 例（按需取消注释）：
+#
+# per_task:
+#   # 精细任务：块短一点，重规划更勤（注意 source_horizon 必须 >= 该任务的 execution_horizon）
+#   insert charger:
+#     execution_horizon: 12
+#     num_steps: 80
+#   fill pen holder:
+#     execution_horizon: 12
+#   # 步数预算撞墙的任务：开压缩换 25% 预算
+#   put objects into basket:
+#     action_resample: {enabled: true, source_horizon: 20, gripper_guard: 0.2, max_step_rad: 0.10}
+
+
+# ---------------------------------------------------------------------
+# 3. 关节限位（弧度）—— 顶层键，永远生效，不受 per_task 影响
+#
+# 为什么在服务端写死：deploy/controller.py:validate_chunk 会拒掉整个 chunk 并进
+# 故障保持，只要某个关节目标超出 SDK 限位 0.02 rad 以上 —— 实测模型会超出约 1.7°，
+# 足以让整轮停住（2026-09-16 真机频繁出现）。服务端先裁，client 就看不到越界值。
+#
+# 来源：pyAgxArm 1.0.0  create_agx_arm_config(robot="piper_x", firmeware_version="v189")
+#       ["joint_limits"]，2026-09-16 在本机实读核对（六个关节全部一致）。
+# server 的 env 里没有 pyAgxArm（那是 client 的硬件 SDK），所以只能写在这里；
+# client 仍是最终守门人 —— 这张表过时了只会让动作幅度小一点，不会放过越界值。
 # 删掉这一段即关闭裁剪。
+# ---------------------------------------------------------------------
 joint_limits:
   - [-2.617994,  2.617994]   # J1
   - [ 0.0,       3.141593]   # J2  ← SDK 单边贴 0
@@ -32,12 +120,22 @@ joint_limits:
   - [-1.553344,  1.553344]   # J4
   - [-1.553344,  1.553344]   # J5
   - [-3.141593,  3.141593]   # J6
-eval_batch: true
-# Opening ratios are dimensionless. Physical conversion belongs to the client.
-# Optional subtraction has no established hardware success guarantee.
-postprocess:
-  enabled: false
-  gripper:
-    squeeze: 0.05
-    squeeze_below: 0.90
-    per_task: {}
+
+
+# ---------------------------------------------------------------------
+# 4. 推理落盘追踪
+#
+# 每次推理把观测（三路图像 JPEG + 14 维 state）与【最终】动作块写入磁盘，
+# 用于复盘真机行为（例如夹爪反复开合）。
+#   trace.jsonl  主分析面：每行 = 一次调用，含 state[14] 与 action[execution_horizon][14]，
+#                可直接画夹爪随时间曲线，无需解码任何图像
+#   images/      每次调用三张 JPEG，作为上下文
+# state/action 的分量次序（与 _STATE_KEYS 一致）：
+#   0-5 左臂六关节 | 6 左夹爪 | 7-12 右臂六关节 | 13 右夹爪
+# 写入的是【后处理之后】的动作，即真正发给客户端的值。
+# ---------------------------------------------------------------------
+trace:
+  enabled: true
+  dir: ~/goai-trace
+  image_quality: 90
+  max_gb: 40

@@ -188,6 +188,82 @@ def test_bad_output_and_case_rejected(model):
         model.get_action()
 
 
+def test_resampling_config_reaches_backend_without_enabling_gripper(monkeypatch, checkpoint):
+    config = {"enabled": True, "source_horizon": 24, "gripper_guard": 0.2, "max_step_rad": 0.1}
+    captured = {}
+
+    def load(**kwargs):
+        captured.update(kwargs)
+        return Backend()
+
+    monkeypatch.setattr(adapter.Model, "_load_policy", staticmethod(load))
+    model = adapter.Model({"checkpoint_path": checkpoint, "action_resample": config})
+    assert captured["action_resample"] == config
+    assert captured["action_horizon"] == 8
+    assert not model.postprocess.enabled
+
+
+def test_per_task_overrides_reach_backend_resolution_and_trace(monkeypatch, checkpoint, tmp_path):
+    captured = {}
+
+    class Backend:
+        model = None
+
+    def load(**kwargs):
+        captured.update(kwargs)
+        return Backend()
+
+    monkeypatch.setattr(adapter.Model, "_load_policy", staticmethod(load))
+    model = adapter.Model(
+        {
+            "checkpoint_path": checkpoint,
+            "execution_horizon": 16,
+            "num_steps": 50,
+            "trace": {"enabled": True, "dir": str(tmp_path / "trace")},
+            "per_task": {
+                "insert charger": {
+                    "execution_horizon": 12,
+                    "num_steps": 80,
+                    "gripper": {"enabled": True, "squeeze": 0.045, "squeeze_below": 0.6},
+                },
+                "put objects into basket": {"action_resample": {"enabled": True, "source_horizon": 20}},
+            },
+        }
+    )
+    assert (model.execution_horizon_for(5), model.num_steps_for(5)) == (12, 80)
+    assert (model.execution_horizon_for(1), model.num_steps_for(1)) == (16, 50)
+    assert (model.execution_horizon_for(0), model.num_steps_for(0)) == (16, 50)
+    assert model.postprocess.spec_for(5) == (True, 0.045, 0.6)
+    assert model.postprocess.spec_for(0)[0] is False
+    settings = captured["task_settings"]
+    assert (settings[5]["execution_horizon"], settings[5]["num_steps"]) == (12, 80)
+    assert settings[1]["action_resample"]["source_horizon"] == 20
+    assert settings[1]["execution_horizon"] == 16
+    meta = json.loads((model.trace.root / "meta.json").read_text())
+    assert meta["per_task"]["insert charger"]["num_steps"] == 80
+    assert meta["per_task"]["put objects into basket"]["action_resample"]["source_horizon"] == 20
+    model.trace.close()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_trace_resampling_status_is_optional(tmp_path, enabled):
+    trace = adapter.TraceWriter({"trace": {"enabled": True, "dir": str(tmp_path)}})
+    status = {"source_horizon": 32, "output_steps": 16, "applied": False, "reason": "gripper_guard"}
+    trace.record(
+        env_id=0,
+        task_index=3,
+        obs={"state": np.zeros(14)},
+        actions=[],
+        action_resample=status if enabled else None,
+    )
+    trace.close()
+    recorded = json.loads((trace.root / "trace.jsonl").read_text())
+    if enabled:
+        assert recorded["action_resample"] == status
+    else:
+        assert "action_resample" not in recorded
+
+
 def test_dcp_coverage_allows_only_true_aliases():
     import torch
 
@@ -317,11 +393,11 @@ def _steps(values):
     ]
 
 
-def _on(**postprocess):
-    """Enable postprocessing explicitly so subtraction tests exercise the correction."""
+def _on(**gripper):
+    """Enable the gripper correction explicitly so subtraction tests exercise it."""
     cfg = {"enabled": True}
-    cfg.update(postprocess)
-    return adapter.PostProcess({"postprocess": cfg})
+    cfg.update(gripper)
+    return adapter.PostProcess({"gripper": cfg})
 
 
 class TestSqueeze:
@@ -331,7 +407,7 @@ class TestSqueeze:
         assert pp.squeeze == pytest.approx(adapter.DEFAULT_GRIPPER_SQUEEZE)
         assert pp.squeeze_below == pytest.approx(adapter.DEFAULT_GRIPPER_SQUEEZE_BELOW)
         assert pp.per_task == {}
-        assert adapter.PostProcess({"postprocess": {"enabled": True}}).enabled is True
+        assert adapter.PostProcess({"gripper": {"enabled": True}}).enabled is True
 
     def test_presses_a_grasp_tighter(self):
         """Check that presses a grasp tighter."""
@@ -383,40 +459,55 @@ class TestSqueeze:
         assert (pp.last_squeezed, pp.last_total) == (0, 0)
 
     def test_disabled_passes_through(self):
-        pp = adapter.PostProcess({"postprocess": {"enabled": False}})
+        pp = adapter.PostProcess({"gripper": {"enabled": False}})
         out = pp.gripper(_steps([(0.34, 0.34)]), 0.05)
         assert out[0]["left_ee_joint_state"][0] == pytest.approx(0.34)
 
     def test_per_task_overrides_default(self):
         pp = adapter.PostProcess(
-            {"postprocess": {"gripper": {"squeeze": 0.05, "per_task": {"stand_up_bottles": 0.12}}}}
+            {"gripper": {"enabled": True, "squeeze": 0.05}},
+            per_task_gripper={4: (True, 0.12, 0.90)},
         )
         assert pp.squeeze_for(4) == pytest.approx(0.12)
         assert pp.squeeze_for(2) == pytest.approx(0.05)
+        assert pp.spec_for(4) == (True, 0.12, 0.90)
+
+    def test_per_task_enabled_is_independent_of_global(self):
+        pp = adapter.PostProcess(
+            {"gripper": {"enabled": False, "squeeze": 0.05}},
+            per_task_gripper={5: (True, 0.045, 0.6)},
+        )
+        assert pp.spec_for(5) == (True, 0.045, 0.6)
+        assert pp.spec_for(0)[0] is False
 
     def test_per_task_accepts_canonical_instruction(self):
-        pp = adapter.PostProcess({"postprocess": {"gripper": {"per_task": {"Stand up the bottles.": 0.12}}}})
-        assert pp.squeeze_for(4) == pytest.approx(0.12)
+        names, parsed = adapter.Model._parse_per_task({"Stand up the bottles.": {"num_steps": 80}})
+        assert list(parsed) == [4]
+        assert names[4] == "Stand up the bottles."
 
     @pytest.mark.parametrize("bad", [-0.1, 0.6, 1.0])
     def test_rejects_out_of_range_squeeze(self, bad):
         with pytest.raises(ValueError, match="越界"):
-            adapter.PostProcess({"postprocess": {"gripper": {"squeeze": bad}}})
+            adapter.PostProcess({"gripper": {"squeeze": bad}})
 
     @pytest.mark.parametrize("bad", [0.2, 0.49, 1.5])
     def test_rejects_bad_squeeze_below(self, bad):
         with pytest.raises(ValueError, match="squeeze_below"):
-            adapter.PostProcess({"postprocess": {"gripper": {"squeeze_below": bad}}})
+            adapter.PostProcess({"gripper": {"squeeze_below": bad}})
 
     def test_rejects_unknown_task_key(self):
         with pytest.raises(ValueError, match="不是已知任务"):
-            adapter.PostProcess({"postprocess": {"gripper": {"per_task": {"stack_the_boxes": 0.1}}}})
+            adapter.Model._parse_per_task({"stack_the_boxes": {"num_steps": 80}})
 
     def test_rejects_typos(self):
         with pytest.raises(ValueError, match="未知字段"):
-            adapter.PostProcess({"postprocess": {"gripper": {"sqeeze": 0.05}}})
+            adapter.PostProcess({"gripper": {"sqeeze": 0.05}})
         with pytest.raises(ValueError, match="未知字段"):
-            adapter.PostProcess({"postprocess": {"gripper_threshold": {}}})
+            adapter.Model._parse_per_task({"stand up bottles": {"ah": 8}})
+
+    def test_rejects_retired_postprocess_block(self):
+        with pytest.raises(ValueError, match="postprocess 段已废弃"):
+            adapter.PostProcess({"postprocess": {"enabled": False}})
 
 
 LIMITS = [[-2.617994, 2.617994], [0.0, 3.141593], [-2.96706, 0.0],
@@ -499,7 +590,7 @@ class TestRawStats:
     """Check deployment output statistics independently of postprocessing."""
 
     def test_collects_even_when_disabled(self):
-        pp = adapter.PostProcess({"postprocess": {"enabled": False}})
+        pp = adapter.PostProcess({"gripper": {"enabled": False}})
         pp.gripper(_steps([(0.2, 0.8), (0.99, 0.99)]), 0.05)
         out = pp.raw_summary()
         assert "n=4" in out

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import time
 import logging
 import dataclasses
 from typing import Any, Literal, Mapping, TypedDict, cast
@@ -28,6 +29,7 @@ from pi.inference.goai_helpers import (
     _load_checkpoint_manifest_entry,
 )
 from pi.inference.goai_observation import prepare_goai_observation
+from pi.inference.goai_action_resample import ActionResampler
 from pi.models_pytorch.pi0_pytorch import PI0Pytorch
 
 LOGGER = logging.getLogger(__name__)
@@ -373,6 +375,8 @@ class GOAISimPolicy:
         apply_delta: bool,
         seed: int = 0,
         strict_checkpoint: bool = False,
+        action_resample: Mapping[str, Any] | None = None,
+        task_settings: Mapping[int, Mapping[str, Any]] | None = None,
     ) -> None:
         self.checkpoint = Path(checkpoint).expanduser().resolve()
         self.norm_stats_path = Path(norm_stats).expanduser().resolve()
@@ -431,7 +435,30 @@ class GOAISimPolicy:
             raise ValueError("num_steps must be positive")
         self.execution_horizon = action_horizon
         self.num_steps = num_steps
+        self.task_settings: dict[int, dict[str, Any]] = {
+            int(key): dict(value) for key, value in (task_settings or {}).items()
+        }
+        # 每个 task_index 一份重采样器(horizon 和配置都可能按任务不同);None 是全局默认。
+        self._resamplers: dict[int | None, ActionResampler] = {
+            None: ActionResampler.from_config(
+                action_resample, execution_horizon=action_horizon, model_horizon=self.model_config.action_horizon
+            )
+        }
+        for task_index, settings in self.task_settings.items():
+            try:
+                self._resamplers[task_index] = ActionResampler.from_config(
+                    settings.get("action_resample", action_resample),
+                    execution_horizon=int(settings.get("execution_horizon", action_horizon)),
+                    model_horizon=self.model_config.action_horizon,
+                )
+            except ValueError as exc:
+                # 按任务配置出错时必须点名是哪个任务,否则现场只看到一个与任务无关的校验消息。
+                raise ValueError(f"per_task (task_index={task_index}): {exc}") from None
+        self.action_resampler = self._resamplers[None]
+        self.last_resample: dict[str, Any] | None = None
         self.compile_mode = compile_mode
+        # Per-stage timings of the most recent infer(); None until the first call.
+        self.last_timing: dict[str, float] | None = None
 
         self.use_quantile_norm = bool(self.training_contract["use_quantile_norm"])
         self.norm_stats = normalize_mod.deserialize_json(self.norm_stats_path.read_text())
@@ -592,10 +619,25 @@ class GOAISimPolicy:
             data["embodiment_index"] = torch.tensor([self.embodiment_index], dtype=torch.long, device=self.device)
         return Observation.from_dict(data)
 
+    def execution_horizon_for(self, task_index) -> int:
+        """本任务的执行块长度;没有按任务覆盖就用全局。"""
+        settings = None if task_index is None else self.task_settings.get(int(task_index))
+        return self.execution_horizon if settings is None else int(settings.get("execution_horizon", self.execution_horizon))
+
+    def num_steps_for(self, task_index) -> int:
+        settings = None if task_index is None else self.task_settings.get(int(task_index))
+        return self.num_steps if settings is None else int(settings.get("num_steps", self.num_steps))
+
+    def resampler_for(self, task_index) -> ActionResampler:
+        key = None if task_index is None else int(task_index)
+        return self._resamplers.get(key, self._resamplers[None])
+
     def infer(self, observation: Mapping[str, Any], session: GOAIPolicySession) -> list[dict[str, np.ndarray]]:
         """Infer one executable action chunk from a raw RoboDojo observation."""
+        t0 = time.perf_counter()
         raw_state = assemble_goai_state(observation)
         model_observation = self._prepare_observation(observation, raw_state, session)
+        t_prepare = time.perf_counter()
         noise = torch.randn(
             (1, self.model_config.action_horizon, self.model_config.action_dim),
             dtype=torch.float32,
@@ -611,9 +653,12 @@ class GOAISimPolicy:
                 device=self.device,
                 observation=model_observation,
                 noise=noise,
-                num_steps=self.num_steps,
+                num_steps=self.num_steps_for(session.task_index),
             )
+        # .cpu() is the sync point for the denoising work, so timing it after the
+        # transfer measures the actual compute rather than kernel launches.
         normalized = normalized[0, :, :GOAI_ACTION_DIM].float().cpu().numpy()
+        t_denoise = time.perf_counter()
         actions = unnormalize_actions(
             normalized,
             self.norm_stats["actions"],
@@ -621,5 +666,22 @@ class GOAISimPolicy:
             use_quantile_norm=self.use_quantile_norm,
         )
         actions = apply_absolute_actions_goai(actions, raw_state, apply_delta=self.apply_delta)
+        horizon = self.execution_horizon_for(session.task_index)
+        resampler = self.resampler_for(session.task_index)
+        self.last_resample = None
+        if resampler.enabled:
+            actions, self.last_resample = resampler.select(actions, raw_state)
+            actions = action_chunk_to_robodojo(actions)
+        else:
+            actions = action_chunk_to_robodojo(actions[:horizon])
+        t_decode = time.perf_counter()
+        # Persisted by TraceWriter so a slow run can be attributed to a stage
+        # instead of guessed at. Not part of the model's behaviour.
+        self.last_timing = {
+            "prepare_ms": (t_prepare - t0) * 1000.0,
+            "denoise_ms": (t_denoise - t_prepare) * 1000.0,
+            "decode_ms": (t_decode - t_denoise) * 1000.0,
+            "infer_ms": (t_decode - t0) * 1000.0,
+        }
         session.step += 1
-        return action_chunk_to_robodojo(actions[: self.execution_horizon])
+        return actions
