@@ -43,7 +43,7 @@ scores are documented below; they do not measure this policy's physical success.
 │   ├── sim_server.py        # WS policy server（v1.0.0 CALL + 兼容旧版 infer）
 │   ├── mock_goai_client.py  # 协议冒烟客户端（自测用）
 │   └── sanitize_manifest.py # checkpoint manifest 脱敏工具
-├── policy/pi05_goai/        # RoboDojo policy 目录接口（启动脚本 / eval 入口 / 元数据）
+├── policy/lionvla/          # XPolicyLab policy 目录接口（__init__.py + deploy.py）
 ├── assets/                  # 内置 tokenizer
 ├── docs-GOAI/               # 比赛提交文档（数据 / 简介 / 技术方案 / 评测启动方式）
 ├── pixi.toml / pixi.lock    # 环境定义（goai-inference：Python 3.10 / PyTorch 2.7.1 CUDA 12.9）
@@ -95,13 +95,13 @@ hello → prepare_case → reset → 逐步 call(update_obs) → call(get_action
 ## 评测端参考
 
 以下命令在 **RoboDojo 仓库根目录**执行，不属于本提交仓库的安装步骤。评测端
-需先将本仓库的 `policy/pi05_goai` adapter 安装为
-`XPolicyLab/policy/pi05_goai`，再连接已经启动的 policy server：
+需先将本仓库的 `policy/lionvla` adapter 安装为
+`XPolicyLab/policy/lionvla`，再连接已经启动的 policy server：
 
 ```bash
 bash scripts/robodojo.sh client \
   --task stack_bowls \
-  --policy-name pi05_goai \
+  --policy-name lionvla \
   --policy-host <POLICY_SERVER_HOST> \
   --policy-port 28000 \
   --env-cfg arx_x5 \

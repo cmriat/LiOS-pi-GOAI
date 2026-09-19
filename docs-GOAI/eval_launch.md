@@ -46,7 +46,7 @@ pixi run -e goai-inference python scripts/inference/goai/sim_server.py \
   --apply-delta --seed 0
 ```
 
-亦可经 RoboDojo policy 目录接口启动（见仓库根目录 `policy/pi05_goai/README.md`）。
+亦可经 RoboDojo policy 目录接口启动（见仓库根目录 `policy/lionvla/README.md`）。
 
 **默认策略配置**：`--action-horizon 8`、`--num-steps 20` 无需显式传参；
 `--apply-delta` 为显式必传。服务端加载 checkpoint 时强校验训练契约

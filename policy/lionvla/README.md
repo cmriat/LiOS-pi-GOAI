@@ -2,7 +2,7 @@
 
 This plugin serves the six trained GOAI tasks on PiperX using the existing
 Pi05 task and embodiment embeddings. It runs in the unchanged official
-XPolicyLab server. The preliminary simulation entry remains `policy/pi05_goai`.
+XPolicyLab server. The preliminary simulation entry is `scripts/inference/goai/sim_server.py`, launched via `scripts/serve_goai.sh`.
 
 ## Install and configure
 
