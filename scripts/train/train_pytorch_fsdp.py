@@ -23,9 +23,11 @@ from utils import (
     init_logging,
     clip_grad_norm_,
     log_memory_usage,
+    archive_norm_stats,
     run_test_evaluation,
     fsdp_save_model_checkpoint,
     build_configs_from_parent_dir,
+    build_configs_from_dataset_uris,
     resume_from_fsdp_model_checkpoint,
 )
 from profiling import (
@@ -40,6 +42,7 @@ import pi.training.config as _config  # noqa: E402
 # Import training configs
 import pi.training.instance_config as train_config
 import pi.models_pytorch.pi0_pytorch  # noqa: E402
+import pi.models.model as _model  # noqa: E402
 from pi.ema_model import EMAModel
 
 
@@ -88,6 +91,8 @@ def train_loop(
         if base_config.checkpoint_dir.exists():
             shutil.rmtree(base_config.checkpoint_dir)
         base_config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        archive_norm_stats(configs, base_config.checkpoint_dir, resuming=base_config.resume)
 
     # Load pretrained weights if provided (before FSDP wrapping)
     if base_config.pytorch_weight_path and (not base_config.resume):
@@ -234,7 +239,9 @@ def train_loop(
                     if timing_enabled:
                         timing_prev_step_end_s = time.perf_counter()
                     continue
-                observation = {k: v for k, v in batch.items() if k != "actions"}
+                # The model takes an Observation, not the raw collated dict: the
+                # preprocessing path reads ``observation.images.keys()`` first.
+                observation = _model.Observation.from_dict({k: v for k, v in batch.items() if k != "actions"})
                 actions = batch["actions"].to(torch.float32, non_blocking=True)
                 if timing_enabled:
                     timing_data_iter_s = time.perf_counter() - timing_prev_step_end_s
@@ -408,7 +415,22 @@ def main() -> int:
     base_config = train_config.cli()
     logging.info(f"Training config: {base_config}")
 
-    if base_config.parent_data_dir:
+    if base_config.data.dataset_format == "video_lance" and not isinstance(
+        base_config.data.dataset_uri, (str, type(None))
+    ):
+        cfgs = build_configs_from_dataset_uris(base_config.data.dataset_uri, base_config)
+        # A run has to stay on one config: a checkpoint manifest records one entry per
+        # config name, and the server resolves a checkpoint by that name. Repeated
+        # --data.dataset-uri flags would expand into several configs sharing one name,
+        # i.e. a checkpoint the server could not load. The comma-separated form names
+        # the same several datasets through a single config instead.
+        if len(cfgs) > 1 and len({cfg.name for cfg in cfgs}) == 1:
+            raise SystemExit(
+                "Repeated --data.dataset-uri expands into several configs that share one config "
+                "name, and a checkpoint records one manifest entry per config name. Pass a single "
+                "comma-separated --data.dataset-uri (e.g. 'a.lance,b.lance') instead."
+            )
+    elif base_config.parent_data_dir:
         cfgs = build_configs_from_parent_dir(base_config.parent_data_dir, base_config)
     else:
         cfgs = [base_config]

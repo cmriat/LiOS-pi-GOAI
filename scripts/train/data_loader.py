@@ -1,4 +1,4 @@
-"""Distributed LeRobot dataloader with CUDA prefetching and image augmentation."""
+"""Distributed LeRobot dataloader with CUDA prefetching."""
 
 import os
 import glob
@@ -9,23 +9,11 @@ from typing import Any, List
 
 import numpy as np
 import torch
-from utils import init_dist as _init_dist, validate_shared_fields as _validate_shared_fields
+from utils import init_dist as _init_dist, validate_shared_fields as _validate_shared_fields, _repo_id_from_dataset_uri
 
-import pi.models.model as _model  # noqa: E402
 import pi.training.config as _config  # noqa: E402
-
-# Import training configs
-import pi.training.instance_config as train_config
-from pi.data import MultiLeRobotLoader, _stack_tree  # noqa: E402
+from pi.data import MultiLeRobotLoader, _stack_tree, _dataset_uri_values  # noqa: E402
 from pi.training.config import DatasetConfig  # noqa: E402
-from pi.models_pytorch.preprocessing_pytorch import (
-    IMAGE_KEYS,
-    IMAGE_RESOLUTION,
-    hsv_to_rgb_torch,
-    rgb_to_hsv_torch,
-    adjust_contrast_torch,
-    adjust_brightness_torch,
-)
 
 
 def worker_init_fn(worker_id: int):
@@ -51,9 +39,12 @@ def _get_local_world_size(fallback: int) -> int:
 
 
 def _build_dataset_configs(configs: List[_config.TrainConfig]) -> List[DatasetConfig]:
-    """Build DatasetConfig from TrainConfig list.
+    """Build the DatasetConfig each dataset is read through.
 
-    Loads normalization stats and extracts dataset-specific parameters.
+    Loads normalization stats and extracts dataset-specific parameters. A VideoLance
+    config naming several datasets expands to one DatasetConfig per URI, so
+    MultiLeRobotLoader reads each Lance source on its own while the run keeps a single
+    training config -- and therefore a single archived manifest record.
     """
     ds_cfgs: List[DatasetConfig] = []
     for cfg in configs:
@@ -67,16 +58,33 @@ def _build_dataset_configs(configs: List[_config.TrainConfig]) -> List[DatasetCo
             raise ValueError(f"Normalization stats missing for '{cfg.name}'. Run scripts/compute_norm_stats.py first.")
 
         # Determine if using quantile normalization (PI0.5 models use quantiles, PI0 uses z-score)
-        use_quantile_norm = cfg.model.model_type != _model.ModelType.PI0
+        use_quantile_norm = cfg.effective_use_quantile_norm
 
-        ds_cfgs.append(
-            dataclasses.replace(
-                cfg.data,
-                norm_stats=norm_stats,
-                policy_name=cfg.name,
-                use_quantile_norm=use_quantile_norm,
+        uris = _dataset_uri_values(cfg.data.dataset_uri, cfg.data.repo_id)
+        if len(uris) == 1 or cfg.data.dataset_format != "video_lance":
+            ds_cfgs.append(
+                dataclasses.replace(
+                    cfg.data,
+                    norm_stats=norm_stats,
+                    policy_name=cfg.name,
+                    use_quantile_norm=use_quantile_norm,
+                )
             )
-        )
+            continue
+
+        # Mixed run: the URIs share one stats file, which is how the datasets are
+        # normalized into a single action/state space, and each keeps its own name.
+        for uri in uris:
+            ds_cfgs.append(
+                dataclasses.replace(
+                    cfg.data,
+                    repo_id=_repo_id_from_dataset_uri(uri),
+                    dataset_uri=uri,
+                    norm_stats=norm_stats,
+                    policy_name=cfg.name,
+                    use_quantile_norm=use_quantile_norm,
+                )
+            )
     return ds_cfgs
 
 
@@ -105,138 +113,6 @@ def build_configs_from_parent_dir(
     return cfgs
 
 
-def preprocess_observation_pytorch_from_dict(
-    observation_dict: dict,
-    *,
-    train: bool = True,
-    image_keys: tuple[str, ...] = IMAGE_KEYS,
-    image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
-) -> dict:
-    """dict-in/dict-out variant of preprocess_observation_pytorch."""
-    _ = image_resolution  # keep signature aligned with preprocess_observation_pytorch
-    images = observation_dict["image"]
-    image_masks = observation_dict.get("image_mask", {})
-    state = observation_dict["state"]
-
-    for key in images:
-        assert hasattr(images[key], "dtype") and images[key].dtype == torch.uint8
-        images[key] = images[key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
-
-    if not set(image_keys).issubset(images):
-        raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(images)}")
-
-    batch_shape = state.shape[:-1]
-
-    out_images = {}
-    for key in image_keys:
-        image = images[key]
-
-        is_channels_first = image.shape[1] == 3
-        if is_channels_first:
-            image = image.permute(0, 2, 3, 1)
-
-        if train:
-            image = image / 2.0 + 0.5
-            if "wrist" not in key:
-                height, width = image.shape[1:3]
-                batch_size = image.shape[0]
-
-                crop_height = int(height * 0.95)
-                crop_width = int(width * 0.95)
-
-                max_h = height - crop_height
-                max_w = width - crop_width
-                if max_h > 0 and max_w > 0:
-                    start_h = torch.randint(0, max_h + 1, (batch_size,), device=image.device)
-                    start_w = torch.randint(0, max_w + 1, (batch_size,), device=image.device)
-
-                    h_indices = torch.arange(crop_height, device=image.device).view(1, -1, 1)
-                    w_indices = torch.arange(crop_width, device=image.device).view(1, 1, -1)
-
-                    h_coords = start_h.view(-1, 1, 1) + h_indices
-                    w_coords = start_w.view(-1, 1, 1) + w_indices
-
-                    h_coords = h_coords.expand(batch_size, crop_height, crop_width)
-                    w_coords = w_coords.expand(batch_size, crop_height, crop_width)
-
-                    batch_indices = (
-                        torch.arange(batch_size, device=image.device)
-                        .view(-1, 1, 1)
-                        .expand(batch_size, crop_height, crop_width)
-                    )
-                    image = image[batch_indices, h_coords, w_coords, :]
-
-                image = torch.nn.functional.interpolate(
-                    image.permute(0, 3, 1, 2),
-                    size=(height, width),
-                    mode="bilinear",
-                    align_corners=False,
-                ).permute(0, 2, 3, 1)
-
-                angles = torch.rand(batch_size, device=image.device) * 10 - 5
-                angles_rad = angles * torch.pi / 180.0
-
-                cos_angles = torch.cos(angles_rad)
-                sin_angles = torch.sin(angles_rad)
-
-                grid_x = torch.linspace(-1, 1, width, device=image.device)
-                grid_y = torch.linspace(-1, 1, height, device=image.device)
-                grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
-
-                grid_x = grid_x.unsqueeze(0).expand(batch_size, -1, -1)
-                grid_y = grid_y.unsqueeze(0).expand(batch_size, -1, -1)
-
-                cos_a = cos_angles.view(batch_size, 1, 1)
-                sin_a = sin_angles.view(batch_size, 1, 1)
-
-                grid_x_rot = grid_x * cos_a - grid_y * sin_a
-                grid_y_rot = grid_x * sin_a + grid_y * cos_a
-
-                grid = torch.stack([grid_x_rot, grid_y_rot], dim=-1)
-
-                image = torch.nn.functional.grid_sample(
-                    image.permute(0, 3, 1, 2).to(torch.float32),
-                    grid,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    align_corners=False,
-                ).permute(0, 2, 3, 1)
-
-            batch_size = image.shape[0]
-
-            hue, saturation, value = rgb_to_hsv_torch(image)
-            torch.manual_seed(1234)
-            brightness_params = (torch.rand(batch_size, device="cpu").to(image.device) * 2 - 1) * 0.3  # [-0.3, 0.3]
-            contrast_params = (torch.rand(batch_size, device="cpu").to(image.device) * 2 - 1) * 0.4  # [-0.4, 0.4]
-            value = adjust_brightness_torch(value, brightness_params)
-            value = adjust_contrast_torch(value, contrast_params)
-
-            image = hsv_to_rgb_torch(hue, saturation, value)
-            image = torch.clamp(image, 0, 1)
-            image = image * 2.0 - 1.0
-        if is_channels_first:
-            image = image.permute(0, 3, 1, 2)
-
-        out_images[key] = image
-    out_masks = {}
-    for key in out_images:
-        if key not in image_masks:
-            out_masks[key] = torch.ones(batch_shape, dtype=torch.bool, device=state.device)
-        else:
-            out_masks[key] = image_masks[key]
-    out_dict = {
-        "actions": observation_dict.get("actions"),
-        "image": out_images,
-        "image_mask": out_masks,
-        "state": state,
-        "tokenized_prompt": observation_dict.get("tokenized_prompt"),
-        "tokenized_prompt_mask": observation_dict.get("tokenized_prompt_mask"),
-        "token_ar_mask": observation_dict.get("token_ar_mask"),
-        "token_loss_mask": observation_dict.get("token_loss_mask"),
-    }
-    return out_dict
-
-
 def numpy_to_tensor(x):
     """Convert numpy or python scalar to tensor."""
     if isinstance(x, np.ndarray):
@@ -247,20 +123,15 @@ def numpy_to_tensor(x):
 
 
 def collate_and_preprocess(batch_list: List[dict[str, Any]]) -> dict[str, Any]:
-    """DataLoader collate_fn.
+    """DataLoader collate_fn: batch the per-sample dicts and convert numpy to tensor.
 
-    - collate batch of dict samples
-    - convert numpy → tensor
-    - preprocess images, masks, prompt, state (like preprocess_observation_pytorch)
+    The samples keep the camera set and the dtypes the dataset produced (uint8 images
+    in ``[H, W, C]``). The uint8 -> [-1, 1] conversion and the training augmentation
+    both belong to the model, which applies each exactly once: ``Observation.from_dict``
+    converts the dtypes, and ``PI0Pytorch.forward`` augments. Preprocessing here as well
+    would augment twice.
     """
-    batch = _stack_tree(batch_list)
-
-    # Run preprocess on the DataLoader worker (CPU). Disable autograd so the
-    # collate path does not build a graph.
-    with torch.no_grad():
-        batch = preprocess_observation_pytorch_from_dict(batch)
-
-    return batch
+    return _stack_tree(batch_list)
 
 
 def tree_map_tensor(fn, x):
@@ -362,7 +233,13 @@ def create_distributed_dataloader(
         action_dim=int(base_model.action_dim),
         max_token_len=int(base_model.max_token_len),
         discrete_state_input=bool(getattr(base_model, "discrete_state_input", True)),
+        use_task_embedding=bool(getattr(base_model, "use_task_embedding", False)),
+        use_language_with_task_embedding=bool(getattr(base_model, "use_language_with_task_embedding", False)),
+        num_tasks=int(getattr(base_model, "num_tasks", 0)),
+        use_embodiment_embedding=bool(getattr(base_model, "use_embodiment_embedding", False)),
+        num_embodiments=int(getattr(base_model, "num_embodiments", 2)),
         apply_delta_transform=bool(getattr(configs[0].data, "apply_delta_transform", True)),
+        use_per_timestamp_action_norm=bool(getattr(configs[0].data, "use_per_timestamp_action_norm", False)),
         state_history_frames=int(getattr(base_model, "state_history_frames", 1)),
         state_delay_frames=int(getattr(base_model, "state_delay_frames", 0)),
         mode="train",
@@ -400,7 +277,13 @@ def create_distributed_dataloader(
             action_dim=int(base_model.action_dim),
             max_token_len=int(base_model.max_token_len),
             discrete_state_input=bool(getattr(base_model, "discrete_state_input", True)),
+            use_task_embedding=bool(getattr(base_model, "use_task_embedding", False)),
+            use_language_with_task_embedding=bool(getattr(base_model, "use_language_with_task_embedding", False)),
+            num_tasks=int(getattr(base_model, "num_tasks", 0)),
+            use_embodiment_embedding=bool(getattr(base_model, "use_embodiment_embedding", False)),
+            num_embodiments=int(getattr(base_model, "num_embodiments", 2)),
             apply_delta_transform=bool(getattr(configs[0].data, "apply_delta_transform", True)),
+            use_per_timestamp_action_norm=bool(getattr(configs[0].data, "use_per_timestamp_action_norm", False)),
             state_history_frames=int(getattr(base_model, "state_history_frames", 1)),
             state_delay_frames=int(getattr(base_model, "state_delay_frames", 0)),
             mode="test",
@@ -430,4 +313,3 @@ def create_distributed_dataloader(
     if test_loader is not None:
         data_loaders["test_loader"] = test_loader
     return data_loaders
-
