@@ -56,3 +56,15 @@ lion-vla-ckpt/
 # Local real-policy deployment inputs and acceptance artifacts
 configs/goai_real/*.local.*
 .tmp/
+
+# 运行期与迁移备份：含本机路径/地址，不进公开仓库
+*.bak
+*.bak-*
+*.bak2
+
+# 由 server.yaml 派生的本地/一次性配置（server.yaml 本身是模板，进仓库）
+# 覆盖 server.local.yaml、server.resample32to20.yaml 这类变体
+configs/goai_real/server.*.yaml
+
+# 工具 scratch
+.spec-workflow/
