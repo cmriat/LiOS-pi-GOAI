@@ -1,0 +1,10 @@
+# Configuration fragment, NOT a standalone server configuration.
+# Copy server.yaml to a separate experiment config and append this top-level block.
+# The live server.yaml is intentionally unchanged. Omission or enabled: false
+# preserves the existing prefix truncation, with no interpolation.
+action_resample:
+  enabled: true
+  source_horizon: 32   # Use 20, 24, or 32 predicted steps; output stays execution_horizon.
+  gripper_guard: 0.2   # Skip this chunk if either gripper's source span exceeds this range.
+  max_step_rad: 0.10  # Guard both state -> first target and consecutive arm targets.
+  # Set a guard to null to disable it explicitly. Method is fixed to PCHIP.
