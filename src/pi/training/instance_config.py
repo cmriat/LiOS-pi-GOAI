@@ -55,8 +55,12 @@ def _goai_config(action_space: str) -> _config.TrainConfig:
         ),
         num_workers=8,
         log_interval=10,
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
+        # The ComboA regularization the submission is defined by
+        # (docs-GOAI/technical_solution.md section 3). The launcher passes the same
+        # values, so the config a checkpoint is resolved through and the submitted
+        # recipe agree; the non-GOAI configs below keep the earlier defaults.
+        optimizer=_optimizer.AdamW(weight_decay=0.05, clip_gradient_norm=1.0),
+        ema_decay=0.9995,
         pytorch_weight_path="./data/pi05/pi05_pt",
         overwrite=True,
         resume=False,
@@ -87,6 +91,23 @@ _CONFIGS = [
             num_tasks=6,
             task_embedding_target="expert",
             state_conditioning_mode="dual",
+        ),
+    ),
+
+    # The same GOAI 14D joint recipe trained from the VideoLance conversion of the
+    # dataset: the Lance backend reads the recorded columns directly, the checkpoint
+    # carries the explicit 14D policy-state contract, and actions are normalized with
+    # per-horizon-step statistics, which is the mode the submitted checkpoint serves.
+    dataclasses.replace(
+        _goai_config("joint"),
+        name="pi05_goai_joint_lance",
+        exp_name="SET_FOR_YOUR_EXPERIMENT",
+        data=dataclasses.replace(
+            _goai_config("joint").data,
+            dataset_format="video_lance",
+            dataset_uri="/path/to/goai_2026_joint.lance",
+            policy_state_schema="goai14d",
+            use_per_timestamp_action_norm=True,
         ),
     ),
 

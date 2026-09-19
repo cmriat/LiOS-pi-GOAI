@@ -29,6 +29,14 @@ class DatasetConfig:
 
     # LeRobot repo id
     repo_id: str = tyro.MISSING
+    # Dataset backend format
+    dataset_format: Literal["lerobot", "video_lance"] = "lerobot"
+    # Dataset URI/path override, for example an s3:// or absolute path to a VideoLance
+    # dataset whose name differs from repo_id. A comma-separated string names several
+    # datasets: they are read through one MultiLeRobotLoader while the run keeps this one
+    # config. A sequence expands to one config per URI (see train_pytorch_fsdp.main),
+    # which is rejected for a multi-dataset run -- a checkpoint describes one config.
+    dataset_uri: str | Sequence[str] | None = None
     # Action and state sequence keys
     action_sequence_keys: Sequence[str] = ("actions",)
     state_sequence_keys: Sequence[str] = ("state",)
@@ -38,10 +46,17 @@ class DatasetConfig:
     apply_delta_transform: bool = True
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
+    # If true, normalize action chunks with per-horizon-step stats. State normalization is unchanged.
+    use_per_timestamp_action_norm: bool = False
     # Normalization stats (loaded at runtime, optional for config definition)
     norm_stats: dict | None = None
     # Policy name (set at runtime)
     policy_name: str = ""
+    # Model-visible state projection. "source" preserves the dataset state; GOAI
+    # checkpoints can name the explicit 14D contract ("goai14d") instead.
+    policy_state_schema: str = "source"
+    # Optional per-dataset fallback when Lance metadata has no embodiment marker.
+    embodiment_index: int | None = None
     test_ep_num: int = 0  # Number of episodes reserved for testing (0 means no test split)
 
     def load_norm_stats(self, assets_dir: epath.Path) -> dict | None:
@@ -115,6 +130,11 @@ class TrainConfig:
     # ==================== Policy Metadata ====================
     # Used to pass metadata to the policy server during inference
     policy_metadata: dict[str, Any] | None = None
+
+    @property
+    def effective_use_quantile_norm(self) -> bool:
+        """Return the normalization family the FSDP data pipeline and manifest use."""
+        return self.model.model_type != _model.ModelType.PI0
 
     @property
     def assets_dirs(self) -> pathlib.Path:

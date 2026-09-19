@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import os
 import glob
+import json
 import math
 import shutil
+import hashlib
 import logging
 import pathlib
 import dataclasses
 from typing import Tuple
+from collections.abc import Sequence
 
 import numpy as np
 import torch
@@ -22,7 +25,11 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.tensor import DTensor
 
+import pi.models.model as _model  # noqa: E402
+import pi.shared.download as _download  # noqa: E402
 import pi.training.config as _config  # noqa: E402
+from pi.shared.embodiment import build_embodiment_contract  # noqa: E402
+from pi.shared.goai_state_contract import build_goai_policy_state_contract  # noqa: E402
 
 logger = logging.getLogger()
 
@@ -77,6 +84,308 @@ def validate_shared_fields(configs: list[_config.TrainConfig]) -> None:
         for c in configs[1:]:
             if fn(c) != v0:
                 raise ValueError(f"All configs must share {name}. Got {v0} vs {fn(c)}")
+
+
+# ------------------------- norm stats archive and training manifest -------------------------
+def _file_sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_copy(source: pathlib.Path, destination: pathlib.Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_json(path: pathlib.Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _dataset_uri_values(dataset_uri: str | Sequence[str] | None) -> list[str]:
+    """Normalize a manifest dataset URI into the list of sources a run reads."""
+    if dataset_uri is None:
+        return []
+    if isinstance(dataset_uri, str):
+        # Comma-separated multi-URI support (e.g. "a.lance,b.lance").
+        return [uri.strip() for uri in dataset_uri.split(",") if uri.strip()]
+    return [str(uri) for uri in dataset_uri if str(uri)]
+
+
+def _dataset_uri_for_manifest(dataset_uri: str | Sequence[str] | None) -> str | list[str] | None:
+    if dataset_uri is None or isinstance(dataset_uri, str):
+        return dataset_uri
+    return [str(uri) for uri in dataset_uri]
+
+
+def _image_geometry_for_manifest(config: _config.TrainConfig) -> dict[str, object] | None:
+    """Read the image geometry contract that every GOAI Lance source must agree on."""
+    if "goai" not in config.name.lower():
+        return None
+    if config.data.dataset_format != "video_lance":
+        raise ValueError(f"{config.name} image geometry can only be archived from a VideoLance dataset")
+    dataset_uris = _dataset_uri_values(config.data.dataset_uri)
+    if not dataset_uris:
+        raise ValueError(f"{config.name} training requires at least one dataset URI")
+
+    import lance
+
+    from pi import data as pi_data
+
+    expected_geometry: dict[str, object] | None = None
+    for dataset_uri in dataset_uris:
+        dataset = lance.dataset(dataset_uri)
+        geometry = pi_data._validate_goai_lance_image_metadata(dict(dataset.schema.metadata or {}), dataset_uri)
+        if expected_geometry is None:
+            expected_geometry = geometry
+        elif geometry != expected_geometry:
+            raise ValueError(
+                f"{config.name} datasets must share one image geometry contract: "
+                f"expected {expected_geometry}, got {geometry} for {dataset_uri!r}"
+            )
+    return expected_geometry
+
+
+def _policy_state_contract_for_manifest(config: _config.TrainConfig) -> dict[str, object] | None:
+    """Archive the state representation visible to the policy separately from source data."""
+    if "goai" not in config.name.lower():
+        return None
+    return build_goai_policy_state_contract(config.data.policy_state_schema)
+
+
+def _manifest_stable_value(entry: dict[str, object], key: str) -> object:
+    """Apply explicit compatibility defaults for historical manifests."""
+    value = entry.get(key)
+    if key == "use_language_with_task_embedding" and value is None:
+        return False
+    if key == "use_embodiment_embedding" and value is None:
+        return False
+    if key == "task_embedding_target" and value is None:
+        return "vlm"
+    if key == "state_conditioning_mode" and value is None:
+        return "discrete_vlm"
+    if key == "policy_state_contract" and value is None and "goai" in str(entry.get("config_name", "")).lower():
+        return build_goai_policy_state_contract("source")
+    return value
+
+
+def archive_norm_stats(configs: list[_config.TrainConfig], checkpoint_dir: pathlib.Path, *, resuming: bool) -> None:
+    """Copy the active normalization stats into the experiment checkpoint directory.
+
+    A resumed run must use the same archived stats and normalization mode. For old
+    checkpoints without archived stats, the current stats are added on first resume.
+    """
+    if not configs:
+        raise ValueError("configs must be non-empty")
+    if resuming and not checkpoint_dir.is_dir():
+        raise FileNotFoundError(f"Checkpoint directory {checkpoint_dir} does not exist for resume")
+
+    manifest_entries = []
+    for index, config in enumerate(configs):
+        asset_id = config.data.asset_id or config.data.repo_id
+        if not asset_id:
+            raise ValueError(f"Asset ID and repo ID are both missing for config '{config.name}'.")
+
+        assets_location = str(config.assets_dirs / asset_id)
+        source_dir = _download.maybe_download(assets_location)
+        source = source_dir / "norm_stats.json"
+        if not source.is_file():
+            raise FileNotFoundError(f"Normalization stats file not found: {source}")
+
+        stats_filename = "norm_stats_pt.json" if config.data.use_per_timestamp_action_norm else "norm_stats.json"
+        if len(configs) == 1:
+            relative_destination = pathlib.Path(stats_filename)
+            legacy_relative_destination = pathlib.Path("norm_stats.json")
+        else:
+            relative_destination = pathlib.Path("norm_stats") / f"{index:02d}" / stats_filename
+            legacy_relative_destination = pathlib.Path("norm_stats") / f"{index:02d}" / "norm_stats.json"
+        if (
+            resuming
+            and config.data.use_per_timestamp_action_norm
+            and not (checkpoint_dir / relative_destination).exists()
+            and (checkpoint_dir / legacy_relative_destination).exists()
+        ):
+            relative_destination = legacy_relative_destination
+        destination = checkpoint_dir / relative_destination
+        source_sha256 = _file_sha256(source)
+
+        if destination.exists():
+            archived_sha256 = _file_sha256(destination)
+            if archived_sha256 != source_sha256:
+                raise ValueError(
+                    f"Normalization stats mismatch for config '{config.name}': active file {source} "
+                    f"has sha256={source_sha256}, but archived file {destination} "
+                    f"has sha256={archived_sha256}. Refusing to resume with different stats."
+                )
+            logging.info(f"Verified archived norm stats for '{config.name}': {destination}")
+        else:
+            _atomic_copy(source, destination)
+            if resuming:
+                logging.warning(f"Added missing norm stats archive to legacy checkpoint: {destination}")
+            else:
+                logging.info(f"Archived norm stats for '{config.name}': {source} -> {destination}")
+
+        source_path = str(source)
+        if len(configs) == 1:
+            # The launcher stages the active stats in a throwaway directory; the manifest
+            # records where they came from instead.
+            source_path = os.environ.get("PI_NORM_STATS_SOURCE_PATH") or source_path
+        use_embodiment_embedding = bool(getattr(config.model, "use_embodiment_embedding", False))
+        entry = {
+            "config_name": config.name,
+            "repo_id": config.data.repo_id,
+            "dataset_uri": _dataset_uri_for_manifest(config.data.dataset_uri),
+            "asset_id": config.data.asset_id,
+            "source_path": source_path,
+            "checkpoint_path": relative_destination.as_posix(),
+            "sha256": source_sha256,
+            "use_quantile_norm": bool(config.effective_use_quantile_norm),
+            "apply_delta_transform": bool(config.data.apply_delta_transform),
+            "use_per_timestamp_action_norm": bool(config.data.use_per_timestamp_action_norm),
+            "use_task_embedding": bool(getattr(config.model, "use_task_embedding", False)),
+            "use_language_with_task_embedding": bool(getattr(config.model, "use_language_with_task_embedding", False)),
+            "task_embedding_target": str(getattr(config.model, "task_embedding_target", "vlm")),
+            "state_conditioning_mode": str(getattr(config.model, "state_conditioning_mode", "discrete_vlm")),
+            "num_tasks": int(getattr(config.model, "num_tasks", 0)),
+            "max_token_len": int(config.model.max_token_len),
+            "action_horizon": config.model.action_horizon,
+            # Written for every entry so a mixed-architecture run still produces a
+            # manifest whose every entry can be read back.
+            "use_embodiment_embedding": use_embodiment_embedding,
+            "image_geometry": _image_geometry_for_manifest(config),
+            "policy_state_contract": _policy_state_contract_for_manifest(config),
+        }
+        if use_embodiment_embedding:
+            num_embodiments = int(getattr(config.model, "num_embodiments", 2))
+            num_embodiment_tokens = int(getattr(config.model, "num_embodiment_tokens", 1))
+            entry.update(
+                {
+                    "num_embodiments": num_embodiments,
+                    "num_embodiment_tokens": num_embodiment_tokens,
+                    "embodiment_contract": build_embodiment_contract(
+                        num_embodiments=num_embodiments,
+                        tokens_per_embodiment=num_embodiment_tokens,
+                    ),
+                }
+            )
+        manifest_entries.append(entry)
+
+    recipe = _resolve_training_recipe()
+    manifest_version = 12 if any(entry["use_embodiment_embedding"] for entry in manifest_entries) else 11
+    manifest = {"version": manifest_version, "files": manifest_entries, "training_recipe": recipe}
+    manifest_path = checkpoint_dir / "norm_stats_manifest.json"
+    if resuming and manifest_path.exists():
+        try:
+            archived_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Could not read archived norm stats manifest: {manifest_path}") from error
+
+        stable_keys = (
+            "config_name",
+            "repo_id",
+            "dataset_uri",
+            "checkpoint_path",
+            "sha256",
+            "use_quantile_norm",
+            "use_per_timestamp_action_norm",
+            "use_task_embedding",
+            "use_language_with_task_embedding",
+            "use_embodiment_embedding",
+            "num_embodiments",
+            "num_embodiment_tokens",
+            "embodiment_contract",
+            "task_embedding_target",
+            "state_conditioning_mode",
+            "num_tasks",
+            "max_token_len",
+            "action_horizon",
+            "image_geometry",
+            "policy_state_contract",
+        )
+        archived_signature = [
+            {key: _manifest_stable_value(entry, key) for key in stable_keys}
+            for entry in archived_manifest.get("files", [])
+        ]
+        current_signature = [
+            {key: _manifest_stable_value(entry, key) for key in stable_keys} for entry in manifest_entries
+        ]
+        if archived_signature != current_signature:
+            raise ValueError(
+                f"Current normalization configuration does not match archived manifest {manifest_path}. "
+                "Refusing to resume with different normalization settings."
+            )
+        _verify_training_recipe_on_resume(archived_manifest, recipe)
+        logging.info(f"Verified archived norm stats manifest: {manifest_path}")
+    else:
+        _atomic_write_json(manifest_path, manifest)
+        if resuming:
+            logging.warning(f"Added missing norm stats manifest to legacy checkpoint: {manifest_path}")
+        else:
+            logging.info(f"Saved norm stats manifest: {manifest_path}")
+
+
+def copy_norm_stats_archive(checkpoint_dir: pathlib.Path, destination: pathlib.Path) -> None:
+    """Copy the experiment-level norm stats archive into a model checkpoint."""
+    manifest = checkpoint_dir / "norm_stats_manifest.json"
+    if not manifest.is_file():
+        raise FileNotFoundError(f"Norm stats manifest not found: {manifest}")
+
+    destination.mkdir(parents=True, exist_ok=True)
+    _atomic_copy(manifest, destination / manifest.name)
+
+    archived_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+    for entry in archived_manifest.get("files", []):
+        relative_path = pathlib.Path(entry["checkpoint_path"])
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(f"Invalid norm stats path in {manifest}: {relative_path}")
+        source = checkpoint_dir / relative_path
+        if not source.is_file():
+            raise FileNotFoundError(f"Archived norm stats referenced by {manifest} are missing: {source}")
+        _atomic_copy(source, destination / relative_path)
+    logging.info(f"Copied norm stats archive into model checkpoint: {destination}")
+
+
+def _resolve_training_recipe() -> dict[str, int]:
+    """Parse the env-gated training knobs (defaults = historical behavior).
+
+    Kept env-only to avoid growing TrainConfig; the values are archived in
+    norm_stats_manifest.json and compared on resume, so a resumed run cannot
+    silently switch the schedule it was launched with.
+
+    The 20000 default is the floor runs archived before the knob existed, and stays the
+    legacy value ``_verify_training_recipe_on_resume`` compares against, so it cannot
+    move to the submission's 0 (docs-GOAI/technical_solution.md section 3) without
+    refusing those resumes. The launcher sets the submission's value explicitly:
+    ``scripts/train/goai/train.sh`` exports ``PI_LR_DECAY_FLOOR_STEPS=0``.
+    """
+    floor = int(os.environ.get("PI_LR_DECAY_FLOOR_STEPS", "20000"))
+    if floor < 0:
+        raise ValueError(f"PI_LR_DECAY_FLOOR_STEPS must be >= 0, got {floor}")
+    return {"decay_floor_steps": floor}
+
+
+def _verify_training_recipe_on_resume(archived_manifest: dict[str, object], recipe: dict[str, int]) -> None:
+    """Reject a resume whose archived env-gated training knobs differ."""
+    legacy_recipe = {"decay_floor_steps": 20000}
+    archived_recipe = archived_manifest.get("training_recipe") or legacy_recipe
+    if archived_recipe != recipe:
+        raise ValueError(
+            f"Training recipe mismatch: archived {archived_recipe} != current {recipe}. "
+            "Refusing to resume with different env-gated training knobs."
+        )
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
@@ -137,10 +446,14 @@ def log_memory_usage(device, step, phase="unknown"):
 
 def lr_schedule(step, total_steps, config):
     lr_config = config.lr_schedule
+    # Parsed before the warmup early-return so a bad value fails at step 0.
+    recipe = _resolve_training_recipe()
+    if step == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
+        logging.info("Effective training recipe: %s", recipe)
     if step < lr_config.warmup_steps:
         init_lr = lr_config.peak_lr / (lr_config.warmup_steps + 1)
         return init_lr + (lr_config.peak_lr - init_lr) * step / lr_config.warmup_steps
-    decay_steps = max(lr_config.decay_steps, total_steps + 20_000)
+    decay_steps = max(lr_config.decay_steps, total_steps + recipe["decay_floor_steps"])
     progress = min(1.0, (step - lr_config.warmup_steps) / max(1, decay_steps - lr_config.warmup_steps))
     cos = 0.5 * (1 + math.cos(math.pi * progress))
     return lr_config.decay_lr + (lr_config.peak_lr - lr_config.decay_lr) * cos
@@ -283,6 +596,42 @@ def build_configs_from_parent_dir(
     return cfgs
 
 
+def _repo_id_from_dataset_uri(uri: str) -> str:
+    """Derive the per-source repo id a VideoLance URI is read under."""
+    basename = uri.rstrip("/").split("?", 1)[0].split("#", 1)[0].rsplit("/", 1)[-1]
+    return basename.removesuffix(".lance") or uri
+
+
+def build_configs_from_dataset_uris(
+    dataset_uri: str | Sequence[str] | None, template: _config.TrainConfig
+) -> list[_config.TrainConfig]:
+    """Build one VideoLance TrainConfig per dataset URI.
+
+    Used for the repeated-flag form of ``--data.dataset-uri``. A run whose configs
+    share a name must be launched with a comma-separated URI instead: a checkpoint
+    manifest may record only one entry per config name (see ``main`` in
+    ``train_pytorch_fsdp.py``), so several configs cannot describe one checkpoint.
+    """
+    uris = _dataset_uri_values(dataset_uri)
+    if not uris:
+        raise ValueError("No dataset URIs provided.")
+    if template.parent_data_dir:
+        raise ValueError("--parent-data-dir cannot be used together with multiple --data.dataset-uri values.")
+
+    cfgs: list[_config.TrainConfig] = []
+    for uri in uris:
+        repo_id = template.data.repo_id if len(uris) == 1 and template.data.repo_id else _repo_id_from_dataset_uri(uri)
+        new_data = dataclasses.replace(
+            template.data,
+            dataset_format="video_lance",
+            repo_id=repo_id,
+            dataset_uri=uri,
+        )
+        cfgs.append(dataclasses.replace(template, data=new_data))
+        logging.info("Built VideoLance config for repo_id=%s uri=%s", repo_id, uri)
+    return cfgs
+
+
 def _tree_map_to_device(item, target_device):
     if isinstance(item, dict):
         return {k: _tree_map_to_device(v, target_device) for k, v in item.items()}
@@ -320,8 +669,12 @@ def run_test_evaluation(
         for test_batch in test_dataloader:
             test_batch = _tree_map_to_device(test_batch, device)
             test_observation_dict = {k: v for k, v in test_batch.items() if k != "actions"}
+            # Same bridge as the training loop: the model reads the observation's own
+            # camera keys and converts the uint8 images, so it takes an Observation
+            # rather than the raw collated dict.
+            test_observation = _model.Observation.from_dict(test_observation_dict)
             test_actions = test_batch["actions"].to(torch.float32)
-            test_loss_tensor = model(test_observation_dict, test_actions)
+            test_loss_tensor = model(test_observation, test_actions)
             if isinstance(test_loss_tensor, (list, tuple)):
                 test_loss_tensor = torch.stack(list(test_loss_tensor))
             elif not isinstance(test_loss_tensor, torch.Tensor):
@@ -417,6 +770,7 @@ def fsdp_save_model_checkpoint(
         rng_path = tmp_ckpt_dir / "rng_state.pth"
         torch.save(rng_state, rng_path)
         logging.info(f"Saved RNG states to {rng_path}")
+        copy_norm_stats_archive(config.checkpoint_dir, tmp_ckpt_dir)
 
     # Atomically rename temp directory to final (only main process does the rename)
     torch.distributed.barrier()
