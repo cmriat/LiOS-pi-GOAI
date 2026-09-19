@@ -2,7 +2,7 @@
 
 ## GOAI real-robot finals
 
-The six-task PiperX policy is available at [policy/Lion_Pi05](policy/Lion_Pi05/README.md). It uses the unchanged official XPolicyLab server and a separately delivered checkpoint.
+The six-task PiperX policy is available at [policy/lionvla](policy/lionvla/README.md). It uses the unchanged official XPolicyLab server and a separately delivered checkpoint.
 
 ```bash
 pixi install --locked

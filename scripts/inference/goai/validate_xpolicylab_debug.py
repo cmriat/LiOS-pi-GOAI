@@ -79,7 +79,7 @@ def main():
                 "--env_cfg_type",
                 "arx_x5",
                 "--policy_name",
-                "Lion_Pi05",
+                "lionvla",
                 "--host",
                 "127.0.0.1",
                 "--port",

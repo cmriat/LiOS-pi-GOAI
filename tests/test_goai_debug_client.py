@@ -3,7 +3,7 @@
 import numpy as np
 from XPolicyLab import debug_env_client as debug
 from XPolicyLab.policy.Pi_05 import deploy as official_deploy
-from XPolicyLab.policy.Lion_Pi05 import deploy
+from XPolicyLab.policy.lionvla import deploy
 from XPolicyLab.utils.process_data import decode_obs_images, get_robot_action_dim_info
 from scripts.inference.goai.debug_xpolicylab_client import TaskFixture
 

@@ -1,4 +1,4 @@
-# Lion_Pi05 real-robot policy
+# lionvla real-robot policy
 
 This plugin serves the six trained GOAI tasks on PiperX using the existing
 Pi05 task and embodiment embeddings. It runs in the unchanged official
@@ -54,7 +54,7 @@ The manifest describes the architecture and hashes the exact statistics file.
 `scripts/inference/goai/sanitize_manifest.py` removes training paths while
 preserving inference fields. Do not substitute another checkpoint's statistics.
 
-Preparation installs `XPolicyLab/policy/Lion_Pi05` as a symlink. It refuses to
+Preparation installs `XPolicyLab/policy/lionvla` as a symlink. It refuses to
 overwrite a different plugin or configuration. Local configurations are ignored
 by Git. `configs/goai_real/server.yaml` is a template with a placeholder path.
 
@@ -68,7 +68,7 @@ warmup and reset before printing `READY FOR INFERENCE`. New tasks or physical
 observations may still trigger compilation. Ctrl-C terminates the supervised
 server. `--timeout` and `--warmup-rounds` are forwarded by the shell launcher.
 
-For official orchestration, use `policy_name: Lion_Pi05` and the same config:
+For official orchestration, use `policy_name: lionvla` and the same config:
 
 ```bash
 pixi run -e goai-inference python scripts/inference/goai/launch_xpolicylab.py \

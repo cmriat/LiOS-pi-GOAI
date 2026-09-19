@@ -74,7 +74,7 @@ def main():
     args = parser.parse_args()
     bench = args.robodojo.resolve()
     sys.path[:0] = [str(bench), str(bench / "XPolicyLab")]
-    from XPolicyLab.policy.Lion_Pi05 import deploy
+    from XPolicyLab.policy.lionvla import deploy
 
     from pi.inference.goai_xpolicylab import resolve_real_task
 
@@ -113,7 +113,7 @@ def main():
         "--env_cfg_type",
         "arx_x5",
         "--policy_name",
-        "Lion_Pi05",
+        "lionvla",
         "--host",
         "127.0.0.1",
         "--port",

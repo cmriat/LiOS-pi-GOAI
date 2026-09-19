@@ -3,7 +3,7 @@
 ## Ownership and checkpoint contract
 
 The unchanged official XPolicyLab server discovers
-`XPolicyLab.policy.Lion_Pi05.model.Model`. This repository implements the
+`XPolicyLab.policy.lionvla.model.Model`. This repository implements the
 model adapter and runtime. `deploy.py` re-exports official Pi_05 episode
 callbacks. Hardware control, physical reset and camera acquisition belong to
 the client and evaluator.

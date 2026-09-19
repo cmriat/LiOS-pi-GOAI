@@ -20,7 +20,7 @@ def main():
     xpl = bench / "XPolicyLab"
     config = args.config.expanduser().resolve()
     server = xpl / "setup_policy_server.py"
-    if not server.is_file() or not config.is_file() or not (xpl / "policy/Lion_Pi05/model.py").is_file():
+    if not server.is_file() or not config.is_file() or not (xpl / "policy/lionvla/model.py").is_file():
         parser.error("Missing official server, config or policy entry; run prepare_xpolicylab.py first")
     env = dict(os.environ)
     paths = [str(pi_root / "src"), str(bench), str(xpl)]
