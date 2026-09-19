@@ -10,6 +10,8 @@ subproject of the [**LiOS**](https://github.com/cmriat/LiOS) embodied-AI infrast
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10-blue.svg)](pixi.toml)
 
+![LiOS-pi-GOAI inference pipeline and component ownership](assets/architecture.svg)
+
 ---
 
 ## Overview

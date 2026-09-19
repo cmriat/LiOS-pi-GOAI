@@ -10,6 +10,8 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10-blue.svg)](pixi.toml)
 
+![LiOS-pi-GOAI 推理链路与组件归属](assets/architecture.svg)
+
 ---
 
 ## 概述
